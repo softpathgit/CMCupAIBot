@@ -1,0 +1,120 @@
+id,ac_name,dist_id,districtname,parliament_id,status,old_id
+1,Sirpur,12,"Kumaram Bheem Asifabad",NULL,1,1
+2,"Chennur (SC)",15,Mancherial,NULL,1,2
+3,"Bellampalli (SC)",15,Mancherial,NULL,1,3
+4,Mancherial,15,Mancherial,NULL,1,4
+5,"Asifabad (ST)",12,"Kumaram Bheem Asifabad",NULL,1,5
+6,"Khanapur (ST)",22,Nirmal,NULL,1,6
+7,Adilabad,1,Adilabad,NULL,1,7
+8,"Boath (ST)",1,Adilabad,NULL,1,8
+9,Nirmal,22,Nirmal,NULL,1,9
+10,Mudhole,22,Nirmal,NULL,1,10
+11,Armur,23,Nizamabad,NULL,1,11
+12,Bodhan,23,Nizamabad,NULL,1,12
+13,"Jukkal (SC)",9,Kamareddy,NULL,1,13
+14,Banswada,23,Nizamabad,NULL,1,14
+15,Yellareddy,9,Kamareddy,NULL,1,15
+16,Kamareddy,9,Kamareddy,NULL,1,16
+17,"Nizamabad (Urban)",23,Nizamabad,NULL,1,17
+18,"Nizamabad (Rural)",23,Nizamabad,NULL,1,18
+19,Balkonda,23,Nizamabad,NULL,1,19
+20,Koratla,5,Jagtial,NULL,1,20
+21,Jagtial,5,Jagtial,NULL,1,21
+22,"Dharmapuri (SC)",5,Jagtial,NULL,1,22
+23,Ramagundam,24,Peddapalli,NULL,1,23
+24,Manthani,24,Peddapalli,NULL,1,24
+25,Peddapalle,24,Peddapalli,NULL,1,25
+26,Karimnagar,10,Karimnagar,NULL,1,26
+27,"Choppadandi (SC)",10,Karimnagar,NULL,1,27
+28,Vemulawada,25,"Rajanna Sircilla",NULL,1,28
+29,Sircilla,25,"Rajanna Sircilla",NULL,1,29
+30,"Manakondur (SC)",10,Karimnagar,NULL,1,30
+31,Huzurabad,10,Karimnagar,NULL,1,31
+32,Husnabad,28,Siddipet,NULL,1,32
+33,Siddipet,28,Siddipet,NULL,1,33
+34,Medak,16,Medak,NULL,1,34
+35,Narayankhed,27,Sangareddy,NULL,1,35
+36,"Andole (SC)",27,Sangareddy,NULL,1,36
+37,Narsapur,16,Medak,NULL,1,37
+38,"Zaheerabad (SC)",27,Sangareddy,NULL,1,38
+39,Sangareddy,27,Sangareddy,NULL,1,39
+40,Patancheru,27,Sangareddy,NULL,1,40
+41,Dubbak,28,Siddipet,NULL,1,41
+42,Gajwel,28,Siddipet,NULL,1,42
+43,Medchal,17,"Medchal Malkajgiri",NULL,1,43
+44,Malkajgiri,17,"Medchal Malkajgiri",NULL,1,44
+45,Quthbullapur,17,"Medchal Malkajgiri",NULL,1,45
+46,Kukatpally,17,"Medchal Malkajgiri",NULL,1,46
+47,Uppal,17,"Medchal Malkajgiri",NULL,1,47
+48,Ibrahimpatnam,26,Rangareddy,NULL,1,48
+49,"Lal Bahadur Nagar",26,Rangareddy,NULL,1,49
+50,Maheswaram,26,Rangareddy,NULL,1,50
+51,Rajendranagar,26,Rangareddy,NULL,1,51
+52,Serilingampally,26,Rangareddy,NULL,1,52
+53,"Chevella (SC)",26,Rangareddy,NULL,1,53
+54,Pargi,30,Vikarabad,NULL,1,54
+55,"Vicarabad (SC)",30,Vikarabad,NULL,1,55
+56,Tandur,30,Vikarabad,NULL,1,56
+57,Musheerabad,4,Hyderabad,NULL,1,57
+58,Malakpet,4,Hyderabad,NULL,1,58
+59,Amberpet,4,Hyderabad,NULL,1,59
+60,Khairatabad,4,Hyderabad,NULL,1,60
+61,"Jubilee Hills",4,Hyderabad,NULL,1,61
+62,Sanathnagar,4,Hyderabad,NULL,1,62
+63,Nampally,4,Hyderabad,NULL,1,63
+64,Karwan,4,Hyderabad,NULL,1,64
+65,Goshamahal,4,Hyderabad,NULL,1,65
+66,Charminar,4,Hyderabad,NULL,1,66
+67,Chandrayangutta,4,Hyderabad,NULL,1,67
+68,Yakutpura,4,Hyderabad,NULL,1,68
+69,Bahadurpura,4,Hyderabad,NULL,1,69
+70,Secunderabad,4,Hyderabad,NULL,1,70
+71,"Secunderabad Cantt (SC)",4,Hyderabad,NULL,1,71
+72,Kodangal,30,Vikarabad,NULL,1,72
+73,Narayanpet,21,Narayanpet,NULL,1,73
+74,Mahbubnagar,14,Mahabubnagar,NULL,1,74
+75,Jadcherla,14,Mahabubnagar,NULL,1,75
+76,Devarkadra,14,Mahabubnagar,NULL,1,76
+77,Makthal,21,Narayanpet,NULL,1,77
+78,Wanaparthy,31,Wanaparthy,NULL,1,78
+79,Gadwal,8,"Jogulamba Gadwal",NULL,1,79
+80,"Alampur (SC)",8,"Jogulamba Gadwal",NULL,1,80
+81,Nagarkurnool,19,Nagarkurnool,NULL,1,81
+82,"Achampet (SC)",19,Nagarkurnool,NULL,1,82
+83,Kalwakurthy,26,Rangareddy,NULL,1,83
+84,Shadnagar,26,Rangareddy,NULL,1,84
+85,Kollapur,19,Nagarkurnool,NULL,1,85
+86,"Devarakonda (ST)",20,Nalgonda,NULL,1,86
+87,"Nagarjuna Sagar",20,Nalgonda,NULL,1,87
+88,Miryalaguda,20,Nalgonda,NULL,1,88
+89,Huzurnagar,29,Suryapet,NULL,1,89
+90,Kodad,29,Suryapet,NULL,1,90
+91,Suryapet,29,Suryapet,NULL,1,91
+92,Nalgonda,20,Nalgonda,NULL,1,92
+93,Munugode,20,Nalgonda,NULL,1,93
+94,Bhongir,33,"Yadadri Bhongiri",NULL,1,94
+95,"Nakrekal (SC)",20,Nalgonda,NULL,1,95
+96,"Thungathurthi (SC)",29,Suryapet,NULL,1,96
+97,Alair,33,"Yadadri Bhongiri",NULL,1,97
+98,Jangaon,6,Jangaon,NULL,1,98
+99,"Ghanpur (Station) (SC)",6,Jangaon,NULL,1,99
+100,Palakurthi,6,Jangaon,NULL,1,100
+101,"Dornakal (ST)",13,Mahabubabad,NULL,1,101
+102,"Mahabubabad (ST)",13,Mahabubabad,NULL,1,102
+103,Narsampet,3,"Warangal Rural",NULL,1,103
+104,Parkal,3,"Warangal Rural",NULL,1,104
+105,"Warangal West",32,"Warangal Urban",NULL,1,105
+106,"Warangal East",32,"Warangal Urban",NULL,1,106
+107,"Waradhanapet (SC)",32,"Warangal Urban",NULL,1,107
+108,Bhupalpalle,7,"Jayashankar Bhupalpalle",NULL,1,108
+109,"Mulugu (ST)",18,Mulugu,NULL,1,109
+110,"Pinapaka (ST)",2,Bhadradri,NULL,1,110
+111,"Yellandu (ST)",2,Bhadradri,NULL,1,111
+112,Khammam,11,Khammam,NULL,1,112
+113,Palair,11,Khammam,NULL,1,113
+114,"Madhira (SC)",11,Khammam,NULL,1,114
+115,"Wyra (ST)",11,Khammam,NULL,1,115
+116,"Sathupalle (SC)",11,Khammam,NULL,1,116
+117,Kothagudem,2,Bhadradri,NULL,1,117
+118,"Aswaraopeta (ST)",2,Bhadradri,NULL,1,118
+119,"Bhadrachalam (ST)",2,Bhadradri,NULL,1,119

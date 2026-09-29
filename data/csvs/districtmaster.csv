@@ -1,0 +1,36 @@
+DistrictNo,DistrictName,status,Nodal_ID,Dist_code,dist_collector,col_mobile_no,spec_officer,special_mobile_no,nodal_sort_order
+1,Adilabad,1,154,01,"Rajarshi Shah (2017)","9069787343, 
+9491053696","V. Sujatha",9394793803,5
+2,"Bhadradri kothagudem",1,38188,02,"Jitesh V. Patil (2016)","9990666528, 9490636555","K. Rajaveeru",9948587555,10
+3,Hanumakonda,1,158,03,"Sneha Shabarish (2017)",9100413333,"A.N.K. Gokul",9848464642,8
+4,Hyderabad,1,38245,04,"Harichandana Dasari(2010)",9100421386,"Satish Reddy, Gymnastic Coach",7842442222,11
+5,Jagithyal,1,152,05,"B.Satya Prasad, IAS (2018)","7011509800, 7995084601","Omkar Nath Yadav",NULL,3
+6,Jangaon,1,156,06,"Rizwanbasha Shaik,IAS (2017)",9703978769,"Abdul Shafi, S.O",9440422861,7
+7,"Jayashankar bhupalpally",1,156,07,"Rahul Sharma, IAS (2017)","9569402710, 7995088365","Abdul Shafi, S.O",9440422861,7
+8,"Jogulamba gadwal",1,155,08,"B.M. Santhosh, IAS(2017)",9100901600,"Dr. D.S. Ravi Teja",9000058884,6
+9,Kamareddy,1,151,09,"Ashish Sangwan (2016)","9818722375, 8985070097","M. Santosh Chary"," 9642478654",2
+10,Karimnagar,1,152,10,"Pamela Satpathy",8500666768,"Omkar Nath Yadav",9985155357,3
+11,Khammam,1,38188,11,"Anudeep Durishetty (2018)",8130609679,"K. Rajaveeru",9948587555,10
+12,"Kumuram bheem (asifabad)",1,154,12,"Venkatesh Dhotre (2017)",9491038555,"V. Sujatha",9394793803,5
+13,Mahabubabad,1,158,13,"Adwait Kumar Singh, IAS (2013)
+","7995085423, 8130665721","A.N.K. Gokul",9848464642,8
+14,Mahabubnagar,1,155,14,"B.Vijiendra, IAS (2006)",9849900897,"Dr. D.S. Ravi Teja",9000058884,6
+15,Mancherial,1,154,15,"Kumar Deepak (2018)",8941016347,"V. Sujatha"," 9394793803",5
+16,Medak,1,159,16,"Rahul Raj","9989712921, 7093923111","Dr. M.Ravi Kumar"," 9866229937",9
+17,Medchal-malkajgiri,1,153,17,"Mikkilineni Manu Choudary,IAS (2017)","7013590111, 7337295555","S. Padmavathi",7893214856,4
+18,Mulugu,1,158,18,"Divakara T.S. (2017)","7259908337, 7331122630","A.N.K. Gokul",9848464642,8
+19,Nagarkurnool,1,155,19,"Badavath Santhosh, IAS(2016)",9963614041,"Dr. D.S. Ravi Teja",9000058884,6
+20,Nalgonda,1,150,20,"Chandrasekhar Badugu, IAS","90632 07343","K. Anitha",9849067997,1
+21,Narayanpet,1,155,21,"Sikta Patnaik (2014)","9560614131, 9154283909","Dr. D.S. Ravi Teja",9000058884,6
+22,Nirmal,1,154,22,"Abhilasha Abhinav, IAS (2018)","9960077755, 9493400011","V. Sujatha"," 9394793803",5
+23,Nizamabad,1,151,23,"Ila Tripathi (2017)","8299269734, 9491933000","M. Santosh Chary"," 9642478654",2
+24,Peddapalli,1,152,24,"Koya Sree Harsha (2018)","9618711808, 7995070700","Omkar Nath Yadav",9985155357,3
+25,"Rajanna sircilla",1,152,25,"Garima Agarwal, IAS",9581336665,"Omkar Nath Yadav",9985155357,3
+26,"Ranga reddy",1,153,26,"Narayana Reddy (2015)",7680959696,"S. Padmavathi",7893214856,4
+27,Sangareddy,1,159,27,"P. Pravinya (2016)",9972017872,"Dr. M.Ravi Kumar",9866229937,9
+28,Siddipet,1,159,28,"K. Hymavathi (2013)",7671955954,"Dr. M.Ravi Kumar",9866229937,9
+29,Suryapet,1,150,29,"Tejas Nandlal Pawar (2018)","9890061263, 9493721234","K. Anitha",9849067997,1
+30,Vikarabad,1,153,30,"Prateek Jain, IAS (2017)",9560577374,"S. Padmavathi",7893214856,4
+31,Wanaparthy,1,155,31,"Adarsh Surabhi, IAS (2018)","9910880096, 9100904739","Dr. D.S. Ravi Teja",9000058884,6
+32,Warangal,1,156,32,"M.Satya Sarada Devi, IAS (2015)","7702406896, 9000317131 ","Abdul Shafi, S.O",9440422861,7
+33,"Yadadri bhuvanagiri",1,150,33,"M.Hanumantha Rao (2013)",8790570027,"K. Anitha",9849067997,1

@@ -1,0 +1,2000 @@
+import sys
+import os
+import re
+import uuid
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel
+from typing import Optional
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+# --------------------------------------------------
+# 1. Ensure Python can find project root (Render-safe)
+# --------------------------------------------------
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
+# --------------------------------------------------
+# 2. Imports
+# --------------------------------------------------
+from rag.chain import get_rag_chain
+from rag.translations import get_translation, MENU_TRANSLATIONS
+from rag.sql_queries import (
+    get_participation_stats, 
+    get_fixture_details, 
+    get_geo_details,
+    get_sport_schedule,
+    get_disciplines_by_level,
+    get_player_venues_by_phone,
+    get_player_venue_by_ack,
+    get_sport_rules
+)
+from rag.location_search import search_district_officer, search_cluster_incharge
+# Also importing get_player_by_phone from lookup (which uses SQL now)
+# rag.lookup imports removed as per privacy policy
+from rag.sql_agent import run_sql_agent
+from rag.venue_search import search_venue_by_level
+
+# --------------------------------------------------
+# 3. Initialize FastAPI App
+# --------------------------------------------------
+app = FastAPI(
+    title="SATG Sports Chatbot API",
+    description="Hybrid RAG + SQL Engine for Player Stats & Rules",
+    version="1.1.0"
+)
+
+# Mount Static Files (Demo UI)
+app.mount("/demo", StaticFiles(directory="static", html=True), name="static")
+
+# 4. Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --------------------------------------------------
+# 5. Models and Globals
+# --------------------------------------------------
+class ChatRequest(BaseModel):
+    query: str
+    session_id: Optional[str] = None  # Added for memory
+    language: Optional[str] = None    # Optional: "en", "te", "hi" - dynamically set/override language
+
+class WhatsAppChatRequest(BaseModel):
+    user_message: Optional[str] = None
+    message: Optional[str] = None # Alias
+    query: Optional[str] = None   # Alias
+    
+    first_name: Optional[str] = None
+    
+    phone_number: Optional[str] = None
+    phone: Optional[str] = None   # Alias
+    mobile: Optional[str] = None  # Alias
+    waId: Optional[str] = None    # Alias (WhatsApp ID)
+    sender: Optional[str] = None  # Alias
+
+# Global RAG Cache (Lazy Loaded)
+rag_chain = None
+
+# In-Memory Chat History: {session_id: [(user, bot), ...]}
+CHAT_SESSIONS = {}
+
+# MENU STATE MANAGEMENT
+SESSION_STATE = {} # {session_id: current_state_str}
+SESSION_DATA = {} # {session_id: {key: val, "language": "en" (default)}}
+
+# MENU CONSTANTS
+MENU_MAIN = "MAIN_MENU"
+MENU_REG_FAQ = "MENU_REG_FAQ"           # 1. Registration FAQ
+MENU_DISCIPLINES = "MENU_DISCIPLINES"
+
+MENU_SCHEDULE = "MENU_SCHEDULE"         # 3. Schedules
+MENU_VENUES = "MENU_VENUES"             # 4. Venues
+MENU_OFFICERS = "MENU_OFFICERS"         # 5. Officers
+MENU_PLAYER_STATUS = "MENU_PLAYER_STATUS" # 6. Player Details
+MENU_MEDALS = "MENU_MEDALS"             # 7. Medal Tally
+MENU_HELPDESK = "MENU_HELPDESK"         # 8. Helpdesk
+MENU_LANGUAGE = "MENU_LANGUAGE"         # 9. Language
+
+# INTERMEDIATE GROUP MENUS
+MENU_GROUP_SPORTS = "MENU_GROUP_SPORTS"   # Sports & Matches
+MENU_GROUP_VENUES = "MENU_GROUP_VENUES"   # Venues & Officials
+MENU_GROUP_HELP = "MENU_GROUP_HELP"       # Help & Language
+
+# SUB-MENUS FOR OFFICERS
+MENU_OFFICERS_DISTRICT = "MENU_OFFICERS_DISTRICT"
+MENU_OFFICERS_CLUSTER = "MENU_OFFICERS_CLUSTER"
+
+# SUB-INTERACTION STATES (Waiting for input)
+STATE_WAIT_PHONE = "STATE_WAIT_PHONE"
+STATE_WAIT_ACK = "STATE_WAIT_ACK"
+STATE_WAIT_LOCATION = "STATE_WAIT_LOCATION"
+STATE_WAIT_SPORT_SCHEDULE = "STATE_WAIT_SPORT_SCHEDULE"
+STATE_WAIT_SPORT_RULES = "STATE_WAIT_SPORT_RULES"
+STATE_WAIT_SPORT_AGE = "STATE_WAIT_SPORT_AGE"
+STATE_WAIT_DIST_OFFICER = "STATE_WAIT_DIST_OFFICER" # Deprecated/Old
+STATE_WAIT_VENUE_CLUSTER = "STATE_WAIT_VENUE_CLUSTER"
+STATE_WAIT_VENUE_MANDAL = "STATE_WAIT_VENUE_MANDAL"
+STATE_WAIT_VENUE_ASSEMBLY = "STATE_WAIT_VENUE_ASSEMBLY"
+STATE_WAIT_VENUE_DISTRICT = "STATE_WAIT_VENUE_DISTRICT"
+
+# GLOBAL NAVIGATION MAP
+GLOBAL_NAV_MAP = {
+    # 1. Registration
+    "1.1": {"type": "text", "key": "TXT_REG_HOWTO"},
+    "1.2": {"type": "text", "key": "TXT_REG_RULES"},
+    "1.3": {"type": "text", "key": "TXT_REG_DOCS"},
+    "1.4": {"type": "text", "key": "TXT_REG_STATUS"},
+    "1.5": {"type": "text", "key": "TXT_REG_FKQ"},
+    
+    # 2. Sports
+    "2.1": {"type": "menu", "target": MENU_DISCIPLINES},
+    "2.2": {"type": "menu", "target": MENU_SCHEDULE},
+    "2.3": {"type": "menu", "target": MENU_MEDALS},
+    
+    # 2.2 Schedule Sub-menu
+    "2.2.1": {"type": "text", "key": "TXT_TOURNAMENT_SCHEDULE"},
+    "2.2.2": {"type": "state_prompt", "target": STATE_WAIT_SPORT_SCHEDULE, "msg": "key:TXT_SCHEDULE_GAME_SEARCH_PROMPT"}, # Special Handling logic needed for msg=key:? Or just make logic handle it?
+    # Actually, logic at line 625 handles 'msg' as raw text. I should change 'msg' to 'key' implies logic change.
+    # Line 635: return create_api_response(msg...
+    # I cannot easily change logic for state_prompt cleanly without changing the handler.
+    # Let's use 'key' for state_prompt too?
+    # Handler for state_prompt (line 633):
+    # msg = nav["msg"]
+    # So I must update handler too if I want to use key.
+    
+    # Let's stick to updating GLOBAL_NAV to use 'key' where 'type' param allows it, BUT line 633 doesn't check 'key'.
+    # I will modify the handler logic in next step. For now, I put "key" here and will update handler.
+    
+    "2.2.2": {"type": "state_prompt", "target": STATE_WAIT_SPORT_SCHEDULE, "key": "TXT_SCHEDULE_GAME_SEARCH_PROMPT"},
+
+    # 3. Venues (New Structure)
+    # 3. Venues (New Structure)
+    "venue_cluster": {"type": "state_prompt", "target": STATE_WAIT_VENUE_CLUSTER, "key": "TXT_VENUE_SEARCH_CLUSTER"},
+    "venue_mandal": {"type": "state_prompt", "target": STATE_WAIT_VENUE_MANDAL, "key": "TXT_VENUE_SEARCH_MANDAL"},
+    "venue_assembly": {"type": "state_prompt", "target": STATE_WAIT_VENUE_ASSEMBLY, "key": "TXT_VENUE_SEARCH_ASSEMBLY"},
+    "venue_district": {"type": "state_prompt", "target": STATE_WAIT_VENUE_DISTRICT, "key": "TXT_VENUE_SEARCH_DISTRICT"},
+    "venue_state": {"type": "text", "key": "TXT_VENUE_STATE_INFO"},
+
+    # Old keys kept for safety or if directly typed
+    "3.1": {"type": "menu", "target": MENU_VENUES}, 
+    "3.2": {"type": "menu_with_state", "target": "MENU_OFFICERS_DISTRICT", "state": STATE_WAIT_DIST_OFFICER},
+    "3.3": {"type": "menu_with_state", "target": "MENU_OFFICERS_CLUSTER", "state": "STATE_WAIT_CLUSTER_INCHARGE"},
+    "3.4": {"type": "menu_with_state", "target": "MENU_OFFICERS_MANDAL", "state": "STATE_WAIT_MANDAL_INCHARGE"},
+
+    # 4. Player Status
+    "4.1": {"type": "state_prompt", "target": STATE_WAIT_PHONE, "key": "TXT_PLAYER_STATUS_PHONE_PROMPT"},
+    "4.2": {"type": "state_prompt", "target": STATE_WAIT_ACK, "key": "TXT_PLAYER_STATUS_ACK_PROMPT"},
+
+    # 5. Help
+    "5.1": {"type": "text", "key": "TXT_HELPLINE_ANSWER"},
+    "5.2": {"type": "text", "key": "TXT_EMAIL_ANSWER"},
+    "5.3": {"type": "menu", "target": MENU_LANGUAGE},
+}
+STATE_WAIT_CLUSTER_INCHARGE = "STATE_WAIT_CLUSTER_INCHARGE"
+STATE_WAIT_MANDAL_INCHARGE = "STATE_WAIT_MANDAL_INCHARGE"
+
+MENU_DISCIPLINES_LEVEL = "MENU_DISCIPLINES_LEVEL"
+MENU_DISCIPLINES_CATEGORY = "MENU_DISCIPLINES_CATEGORY"
+MENU_SELECT_SPORT = "MENU_SELECT_SPORT"
+MENU_GAME_OPTIONS = "MENU_GAME_OPTIONS"
+MENU_SCHEDULE_GAME_SEARCH = "MENU_SCHEDULE_GAME_SEARCH"
+
+PARENT_MAP = {
+    MENU_REG_FAQ: MENU_MAIN,
+    MENU_DISCIPLINES: MENU_MAIN,
+    MENU_SCHEDULE: MENU_MAIN,
+    MENU_VENUES: MENU_MAIN,
+    MENU_OFFICERS: MENU_MAIN,
+    MENU_PLAYER_STATUS: MENU_MAIN,
+    MENU_MEDALS: MENU_MAIN,
+    MENU_HELPDESK: MENU_MAIN,
+    MENU_LANGUAGE: MENU_MAIN,
+    
+    # Sub-states
+    STATE_WAIT_PHONE: MENU_PLAYER_STATUS, # Back to Player Status menu
+    STATE_WAIT_ACK: MENU_PLAYER_STATUS,
+    STATE_WAIT_LOCATION: MENU_VENUES,     # Back to Venues menu
+    STATE_WAIT_SPORT_SCHEDULE: MENU_SCHEDULE,
+    STATE_WAIT_SPORT_RULES: MENU_MAIN, # Or relevant parent
+    STATE_WAIT_DIST_OFFICER: MENU_GROUP_VENUES,
+    STATE_WAIT_CLUSTER_INCHARGE: MENU_GROUP_VENUES,
+    STATE_WAIT_MANDAL_INCHARGE: MENU_GROUP_VENUES,
+    
+    # New Venue States Back Pointers
+    STATE_WAIT_VENUE_CLUSTER: MENU_GROUP_VENUES,
+    STATE_WAIT_VENUE_MANDAL: MENU_GROUP_VENUES,
+    STATE_WAIT_VENUE_ASSEMBLY: MENU_GROUP_VENUES,
+    STATE_WAIT_VENUE_DISTRICT: MENU_GROUP_VENUES,
+    
+    MENU_DISCIPLINES_LEVEL: MENU_MAIN,
+    MENU_SELECT_SPORT: MENU_DISCIPLINES,  # Back to Level Selection
+    MENU_GAME_OPTIONS: MENU_SELECT_SPORT, # Back to Sport List
+    MENU_SCHEDULE_GAME_SEARCH: MENU_SCHEDULE, # Back to Schedules Menu
+
+    # Officers Sub-menus
+    MENU_OFFICERS_DISTRICT: MENU_GROUP_VENUES,
+    MENU_OFFICERS_CLUSTER: MENU_GROUP_VENUES,
+
+    # Intermediate Groups Back Pointers
+    MENU_GROUP_SPORTS: MENU_MAIN,
+    MENU_GROUP_VENUES: MENU_MAIN,
+    MENU_GROUP_HELP: MENU_MAIN,
+}
+
+
+def get_or_init_rag_chain():
+    """
+    Lazy-load RAG chain.
+    This prevents Render startup timeout.
+    """
+    global rag_chain
+    if rag_chain is None:
+        print("🧠 Initializing RAG chain (lazy)...")
+        rag_chain = get_rag_chain()
+        print("✅ RAG chain initialized")
+    return rag_chain
+
+# --------------------------------------------------
+# 6. Helpers & Menu Content
+# --------------------------------------------------
+# --- HELPER: Cluster Search ---
+import difflib
+
+def search_cluster_incharge_helper(user_query):
+    """
+    Searches for the cluster name using fuzzy matching.
+    """
+    try:
+        file_path = "data/new data/Mandal_Incharges_Cleaned.txt"
+        if not os.path.exists(file_path):
+            return "⚠️ Data file not found."
+            
+        target = user_query.strip().lower()
+        results = []
+        
+        # 1. Collect all valid clusters and their full lines
+        cluster_map = {} # {cluster_lower: [line1, line2]}
+        
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if "Cluster:" in line:
+                    # Parse: Mandal: ... | Cluster: XYZ | ...
+                    parts = line.split("|")
+                    if len(parts) >= 2:
+                        # Extract " Cluster: XYZ " -> "XYZ"
+                        c_raw = parts[1].split(":")[1].strip()
+                        c_lower = c_raw.lower()
+                        
+                        if c_lower not in cluster_map:
+                            cluster_map[c_lower] = []
+                        cluster_map[c_lower].append(line.strip())
+        
+        # 2. Exact Match Check
+        if target in cluster_map:
+            results = cluster_map[target]
+            found_name = target
+        else:
+            # 3. Partial/Substring Match (if target > 3 chars)
+            if len(target) > 3:
+                for c_name in cluster_map:
+                    if target in c_name: # target "Akine" in "Akinepalli"
+                        results = cluster_map[c_name]
+                        found_name = c_name
+                        break
+            
+            # 4. Fuzzy Match (if no exact or partial match)
+            if not results:
+                all_clusters = list(cluster_map.keys())
+                matches = difflib.get_close_matches(target, all_clusters, n=1, cutoff=0.55) # Lowered slightly to 0.55
+                
+                if matches:
+                    found_name = matches[0]
+                    results = cluster_map[found_name]
+                else:
+                    return None
+
+        # 5. Format Output
+        if results:
+            # Capitalize the found name for display
+            display_name = found_name.title() 
+            response = f"**Found In-Charge Details for '{display_name}':**\n\n"
+            for res in results[:5]: 
+                response += f"🔹 {res}\n"
+            return response
+            
+        return None
+
+    except Exception as e:
+        return f"Error searching data: {str(e)}"
+
+# --- MENU TEXT HELPERS ---
+def get_menu_data(menu_name, session_id=None):
+    # 1. Determine Language
+    lang = "en"
+    if session_id:
+        lang = SESSION_DATA.get(session_id, {}).get("language", "en")
+    
+    print(f"DEBUG: get_menu_data called with {menu_name} [Lang: {lang}]")
+    
+    # 2. Return Translation Dict
+    # 2. Return Translation Dict
+    return get_translation(menu_name, lang)
+
+def get_msg(key, session_id, **kwargs):
+    """
+    Helper to get translated text with dynamic formatting.
+    """
+    lang = "en"
+    if session_id:
+        lang = SESSION_DATA.get(session_id, {}).get("language", "en")
+    
+    t = get_translation(key, lang)
+    text = t.get("text", "")
+    
+    if kwargs:
+        try:
+            text = text.format(**kwargs)
+        except Exception as e:
+            print(f"Error formatting message {key}: {e}")
+    return text
+
+
+def create_api_response(content, source="menu_system", session_id=None):
+    """
+    Constructs the standardized JSON response.
+    Content can be a string (text only) or a dict ({text, buttons}).
+    """
+    text_val = ""
+    menus_val = []
+    
+    if isinstance(content, dict) and "text" in content:
+        text_val = content.get("text", "")
+        menus_val = content.get("buttons", [])
+    else:
+        text_val = str(content)
+        menus_val = []
+        
+    return {
+        "text": text_val,
+        "menus": menus_val,
+        "isMenusAvailable": len(menus_val) > 0,
+        "source": source,
+        "session_id": session_id
+    }
+
+def format_registrations(registrations, session_id=None):
+    """
+    Standardized formatting for player registration details.
+    """
+    if not registrations:
+        return None
+    
+    header = get_msg("MSG_PLAYER_FOUND_HEADER", session_id)
+    txt = header # E.g. "👤 **Player Details Found**\n\n"
+    
+    for idx, rec in enumerate(registrations):
+        name = rec.get('player_nm', 'N/A')
+        reg_id = rec.get('player_reg_id', 'N/A')
+        sport = rec.get('sport_name') or rec.get('event_name') or get_msg("TXT_UNKNOWN_SPORT", session_id) or "Unknown Sport"
+        
+        # Location
+        loc_parts = [rec.get('villagename'), rec.get('mandalname'), rec.get('districtname')]
+        loc_str = ", ".join([p for p in loc_parts if p]) or "N/A"
+        
+        # Status
+        status = get_msg("TXT_LEVEL_CLUSTER", session_id) or "Cluster/Village Level"
+        if rec.get('is_state_level') == 1: status = get_msg("TXT_LEVEL_STATE", session_id) or "State Level"
+        elif rec.get('is_district_level') == 1: status = get_msg("TXT_LEVEL_DISTRICT", session_id) or "District Level"
+        elif rec.get('is_mandal_level') == 1: status = get_msg("TXT_LEVEL_MANDAL", session_id) or "Mandal Level"
+
+        venue_val = rec.get('venue')
+        venue = venue_val if venue_val and str(venue_val).lower() != 'nan' else (get_msg("TXT_VENUE_PENDING", session_id) or "Venue details pending/TBD")
+        
+        date = rec.get('match_date') or get_msg("TXT_CHECK_SCHEDULE", session_id) or "Check Schedule"
+        incharge = rec.get('cluster_incharge') or "0" 
+        contact = rec.get('incharge_mobile') or "N/A"
+
+        # Fetch Labels
+        lbl_name = get_msg("TXT_LABEL_NAME", session_id)
+        lbl_reg = get_msg("TXT_LABEL_REG_ID", session_id)
+        lbl_loc = get_msg("TXT_LABEL_LOCATION", session_id)
+        lbl_status = get_msg("TXT_LABEL_STATUS", session_id)
+        lbl_venue_det = get_msg("TXT_LABEL_VENUE_DETAILS", session_id)
+        lbl_sport = get_msg("TXT_LABEL_SPORT", session_id)
+        lbl_venue = get_msg("TXT_LABEL_VENUE", session_id)
+        lbl_date = get_msg("TXT_LABEL_DATE", session_id)
+        lbl_coach = get_msg("TXT_LABEL_COACH", session_id)
+        lbl_contact = get_msg("TXT_LABEL_CONTACT", session_id)
+
+        entry = (
+            f"{lbl_name} {name}\n"
+            f"{lbl_reg} {reg_id}\n\n"
+            f"{lbl_loc} {loc_str}\n"
+            f"{lbl_status} {status}\n\n"
+            f"{lbl_venue_det}\n"
+            f"{lbl_sport} {sport}\n"
+            f"{lbl_venue} {venue}\n"
+            f"{lbl_date} {date}\n\n"
+            f"{lbl_coach}\n"
+            f"Name: {incharge}\n"  # "Name" inside subgroup might need label too? using generic Name for now as it wasn't in list
+            f"{lbl_contact} {contact}"
+        )
+        
+        if idx > 0:
+            txt += "\n---\n\n"
+        txt += entry
+    return txt
+
+def extract_plain_text(resp) -> str:
+    """Try to extract a single answer string from various response shapes."""
+    if resp is None:
+        return ""
+    
+    # If it's a dict, extract text from it
+    if isinstance(resp, dict):
+        return _extract_from_dict(resp)
+        
+    # If it's a list/tuple, extract from first item
+    if isinstance(resp, (list, tuple)):
+        return _extract_from_list(resp)
+
+    # Convert to string
+    s = str(resp).strip()
+    
+    # RECURSIVE PARSING: If the string ITSELF looks like a JSON dict, parse it!
+    # Check for both standard JSON {"key": "val"} and Python Dict {'key': 'val'}
+    if (s.startswith("{") and s.endswith("}")):
+        # 1. Try JSON
+        try:
+            import json
+            parsed = json.loads(s)
+            # Recursively extract from the parsed dict
+            return extract_plain_text(parsed)
+        except:
+            # 2. Try Python Literal (for single quotes)
+            try:
+                import ast
+                parsed = ast.literal_eval(s)
+                if isinstance(parsed, dict):
+                    return extract_plain_text(parsed)
+            except:
+                pass
+
+            # 3. Fallback: Regex extraction for common keys (if eval failed due to syntax)
+            # Looks for 'response': '...' or "response": "..."
+            import re
+            match = re.search(r"['\"](response|answer|text|result)['\"]\s*:\s*['\"](.*?)['\"]\s*(?:,|})", s, re.DOTALL)
+            if match:
+                return match.group(2)
+                
+    return s
+
+def _extract_from_dict(d: dict) -> str:
+    # Preferred scalar keys
+    for key in ("response", "answer", "text", "content", "message", "output", "result"):
+        v = d.get(key)
+        # If we find a value, we must potentially UNWRAP it again if it's a JSON string
+        if v:
+            return extract_plain_text(v)
+            
+    for key in ("choices", "outputs", "results"):
+        if key in d:
+            return extract_plain_text(d[key])
+            
+    # Heuristic: return the first string value found
+    for v in d.values():
+        candidate = extract_plain_text(v)
+        if candidate and candidate != "None" and len(candidate) > 0:
+            return candidate
+    return ""
+
+def _extract_from_list(lst) -> str:
+    for item in lst:
+        candidate = extract_plain_text(item)
+        if candidate:
+            return candidate
+    try:
+        return " ".join([str(x) for x in lst])
+    except Exception:
+        return ""
+
+# --------------------------------------------------
+# 7. Health Check
+# --------------------------------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/")
+def read_root():
+    return {
+        "status": "online",
+        "message": "SATG Chatbot Engine is Running 🚀"
+    }
+
+# --------------------------------------------------
+# 8. Main Chat Endpoint (Hybrid Router)
+# --------------------------------------------------
+def get_discipline_response(level_num, session_id):
+    level_map = {1: "cluster", 2: "mandal", 3: "assembly", 4: "district", 5: "state"}
+    if level_num in level_map:
+        from rag.sql_queries import get_disciplines_by_level
+        level_name = level_map[level_num]
+        try:
+            games = get_disciplines_by_level(level_name)
+            
+            # Retrieve Localized Level Titles
+            titles = {
+                "cluster": get_msg("TXT_LEVEL_CLUSTER", session_id),
+                "mandal": get_msg("TXT_LEVEL_MANDAL", session_id),
+                "assembly": get_msg("TXT_LEVEL_ASSEMBLY", session_id),
+                "district": get_msg("TXT_LEVEL_DISTRICT", session_id),
+                "state": get_msg("TXT_LEVEL_STATE", session_id)
+            }
+            display_title = titles.get(level_name, level_name.title() + " Level")
+
+            if games:
+                if session_id:
+                    SESSION_STATE[session_id] = MENU_SELECT_SPORT
+                    if session_id not in SESSION_DATA: SESSION_DATA[session_id] = {}
+                    SESSION_DATA[session_id].update({"sports": games, "level_title": display_title})
+
+                buttons = [{"name": g, "value": str(i)} for i, g in enumerate(games, 1)]
+                
+                header = get_msg("TXT_SPORTS_AT_LEVEL", session_id, level=display_title)
+                prompt = get_msg("TXT_SELECT_SPORT_BELOW", session_id)
+                txt = f"### {header}\n\n{prompt}"
+                return create_api_response({"text": txt, "buttons": buttons}, "sql_database", session_id)
+            else:
+                 return create_api_response(get_msg("MSG_NO_SPORTS_LEVEL", session_id, level=display_title), "sql_database", session_id)
+        except Exception as e:
+            print(f"Error fetching disciplines: {e}")
+            return create_api_response("❌ An error occurred while fetching disciplines. Please try again.", "error_handler", session_id)
+    return None
+
+async def process_user_query(raw_query: str, session_id: str = None, phone_number: str = None):
+    """
+    Unified Logic Handler: Menu -> SQL -> RAG
+    """
+    user_query = raw_query.strip().lower()
+    # session_id passed as argument
+    
+    # ------------------------------------------------
+    # 0. MENU STATE MACHINE
+    # ------------------------------------------------
+    
+    # Global Exit Commands
+    if user_query in ["0", "exit", "quit"]:
+         SESSION_STATE.pop(session_id, None)
+    if user_query in ["0", "exit", "quit"]:
+         SESSION_STATE.pop(session_id, None)
+         return create_api_response(get_msg("MSG_SESSION_ENDED", session_id), "menu_system", session_id)
+
+    # Global Reset (Home) Commands
+    reset_cmds = ["hi", "hello", "menu", "start", "restart", "home", "cmcup", "main menu", "menu main", "main", "go to main menu"]
+    if user_query in reset_cmds or user_query.startswith("main_"):
+        if session_id:
+            SESSION_STATE[session_id] = MENU_MAIN
+            
+        # Handle MAIN_X payloads specifically (if user clicked a button from history)
+        if user_query.startswith("main_"):
+            try:
+                # If valid MAIN_X, we might want to let it fall through to the digit logic below?
+                # But digit logic expects "1" not "MAIN_1".
+                # So we must parse it here or transform it.
+                # Transform: split identifiers
+                 choice_idx = int(user_query.split("_")[1])
+                 user_query = str(choice_idx)
+                 # We already reset state to MENU_MAIN above.
+                 # So now user_query="1", state=MENU_MAIN -> will fall through to logic below!
+            except:
+                pass
+
+
+        # If it's just a reset command, return menu immediately.
+        if user_query in reset_cmds:
+            # Check if we are already at main menu and this is a redundant "back" or "menu"
+            # But usually we just show proper menu. 
+            # If the user says "back" but is at main menu?
+            # GLOBAL_NAV "back" isn't explicitly defined, it's usually dynamic.
+            # Wait, invalid logic in verification script implies "back" calls this block?
+            # "back" is NOT in reset_cmds list above (line 531).
+            # Ah, "back" logic is likely further down or implicitly handled?
+            # Let's check implicit "back" logic.
+            
+            return create_api_response(get_menu_data(MENU_MAIN, session_id), "menu_system", session_id)
+            
+    # Get Current State
+    current_state = SESSION_STATE.get(session_id, MENU_MAIN) if session_id else MENU_MAIN
+    
+    # Implicit "Back" Handling
+    if user_query in ["back", "go back", "return"]:
+        parent = PARENT_MAP.get(current_state)
+        if parent:
+            if session_id: SESSION_STATE[session_id] = parent
+            return create_api_response(get_menu_data(parent, session_id), "menu_system", session_id)
+        else:
+            # Already at root or no parent
+            # If at MENU_MAIN, say so
+            if current_state == MENU_MAIN:
+                return create_api_response(get_msg("MSG_ALREADY_MAIN_MENU", session_id), "menu_system", session_id)
+            else:
+                 # Default fallback to Main
+                 if session_id: SESSION_STATE[session_id] = MENU_MAIN
+                 return create_api_response(get_menu_data(MENU_MAIN, session_id), "menu_system", session_id)
+        
+    # Get Current State
+    current_state = SESSION_STATE.get(session_id, MENU_MAIN) if session_id else MENU_MAIN
+
+    # ------------------------------------------------
+    # KEYWORD SHORTCUTS (Direct Jumps)
+    # ------------------------------------------------
+    # 6. Global Navigation Check
+    nav = GLOBAL_NAV_MAP.get(user_query)
+    if nav:
+         target = nav.get("target")
+         type_ = nav.get("type")
+         
+         if type_ == "menu":
+             if session_id: SESSION_STATE[session_id] = target
+             return create_api_response(get_menu_data(target, session_id), "menu_system", session_id)
+             
+         elif type_ == "menu_with_state":
+             if session_id: SESSION_STATE[session_id] = nav.get("state")
+             return create_api_response(get_menu_data(target, session_id), "menu_system", session_id)
+         
+         elif type_ == "state_prompt":
+             if session_id: SESSION_STATE[session_id] = target
+             # Support both 'key' (for translation) and 'msg' (raw)
+             msg_key = nav.get("key")
+             if msg_key:
+                 msg = get_msg(msg_key, session_id)
+             else:
+                 msg = nav.get("msg", "Please enter details:")
+                 
+             return create_api_response(msg, "prompt", session_id)
+             
+         elif type_ == "text":
+             # If key is present, get translation
+             if "key" in nav:
+                 return create_api_response(get_msg(nav["key"], session_id), "text", session_id)
+             return create_api_response(nav.get("msg", ""), "text", session_id)
+    
+     # Global Interceptor for Level Switching (Fix for Cross-Menu Navigation)
+    if user_query.startswith("level_"):
+        try:
+            lvl_num = int(user_query.split("_")[1].strip())
+            # Directly handle logic
+            resp = get_discipline_response(lvl_num, session_id)
+            if resp:
+                # SESSION_STATE is updated inside get_discipline_response
+                return resp
+        except:
+            pass
+
+    # ------------------------------------------------
+    # GLOBAL NUMERIC INTERCEPTOR (1.1, 2.1, etc.)
+    # ------------------------------------------------
+    
+    # MANUAL OVERRIDE FOR VENUES (3.1) - Dynamic Data
+    if user_query == "3.1":
+        from rag.data_store import get_datastore
+        ds = get_datastore()
+        if not ds.initialized: ds.init_db()
+        
+        # Query distinct venues
+        df = ds.query("SELECT DISTINCT venue FROM tb_fixtures WHERE venue IS NOT NULL AND venue != ''")
+        
+        if not df.empty:
+            venues = [v['venue'] for v in df.to_dict(orient="records")]
+            venues = sorted(list(set([v.strip() for v in venues if v and str(v).lower() != 'nan'])))
+            
+            if not venues:
+                 return create_api_response("ℹ️ No specific venue names are currently listed in the schedule.", "sql_database", session_id)
+                 
+            lang = SESSION_DATA.get(session_id, {}).get("language", "en")     
+            txt = get_translation("TXT_VENUE_LIST_HEADER", lang)["text"]
+            for v in venues[:50]:
+                txt += f"• **{v}**\n"
+            
+            txt += "\nType a **Venue Name** or 'Back'."
+            return create_api_response(txt, "sql_database", session_id)
+        else:
+            return create_api_response("ℹ️ No venue information found in the schedule database.", "sql_database", session_id)
+
+    if user_query in GLOBAL_NAV_MAP:
+        print(f"⚡ Global Navigation Triggered: {user_query}")
+        nav = GLOBAL_NAV_MAP[user_query]
+        n_type = nav.get("type")
+        
+        if n_type == "text":
+            # Return static text (either from key or msg)
+            lang = SESSION_DATA.get(session_id, {}).get("language", "en") if session_id else "en"
+            
+            if "key" in nav:
+                return create_api_response(get_translation(nav["key"], lang), "global_nav", session_id)
+            else:
+                return create_api_response(nav["msg"], "global_nav", session_id)
+                
+        elif n_type == "menu":
+            # set state and return menu data
+            target = nav["target"]
+            if session_id: SESSION_STATE[session_id] = target
+            return create_api_response(get_menu_data(target, session_id), "menu_system", session_id)
+            
+        elif n_type == "state_prompt":
+            # set state and return prompt msg
+            target = nav["target"]
+            
+            # Use 'key' if available
+            if "key" in nav:
+                 lang = SESSION_DATA.get(session_id, {}).get("language", "en") if session_id else "en"
+                 msg = get_translation(nav["key"], lang) # Returns dict or text? get_translation returns dict {"text":..., "buttons":...}
+                 # create_api_response handles dict fine
+            else:
+                 msg = nav["msg"]
+
+            if session_id: SESSION_STATE[session_id] = target
+            return create_api_response(msg, "menu_system", session_id)
+            
+        elif n_type == "menu_with_state":
+            # set state AND return menu (which acts as prompt)
+            target = nav["target"]
+            state = nav["state"]
+            if session_id: SESSION_STATE[session_id] = state
+            return create_api_response(get_menu_data(target, session_id), "menu_system", session_id)
+
+    # Global Back Command
+    if user_query in ["back", "previous", "return", "exit"]:
+        # Logic to return to parent
+        if current_state == MENU_MAIN:
+            return create_api_response("You are already at the Main Menu.", "menu_system", session_id)
+        else:
+            # Look up parent
+            parent = PARENT_MAP.get(current_state, MENU_MAIN)
+            if session_id:
+                SESSION_STATE[session_id] = parent
+            return create_api_response(get_menu_data(parent, session_id), "menu_system", session_id)
+
+    # State: WAITING FOR INPUT (Phone, Ack, Location)
+    # If we are in a 'waiting' state, we treat the query as the input value
+    if current_state == STATE_WAIT_PHONE:
+        # Check if it looks like a phone number
+        if re.search(r'\b[6-9]\d{9}\b', user_query):
+            # Direct Lookup Logic
+            phone = re.search(r'\b[6-9]\d{9}\b', user_query).group(0)
+            print(f"⚡ Intent: Menu Phone Lookup ({phone})")
+            
+            # Reset state
+            if session_id: SESSION_STATE[session_id] = MENU_PLAYER_STATUS
+            
+            # SQL Lookup
+            registrations = get_player_venues_by_phone(phone)
+            
+            if registrations:
+                txt = format_registrations(registrations, session_id)
+                return create_api_response(txt, "sql_database", session_id)
+            else:
+                return create_api_response(get_msg("ERR_NO_REGISTRATION", session_id, phone=phone), "sql_database", session_id)
+        else:
+             return create_api_response(get_msg("ERR_INVALID_PHONE", session_id), "validation_error", session_id)
+    
+
+
+    # State: WAITING FOR VENUE - CLUSTER
+    if current_state == STATE_WAIT_VENUE_CLUSTER:
+        return create_api_response(search_venue_by_level('CLUSTER', user_query, session_id), "sql_database", session_id)
+
+    # State: WAITING FOR VENUE - MANDAL
+    if current_state == STATE_WAIT_VENUE_MANDAL:
+        return create_api_response(search_venue_by_level('MANDAL', user_query, session_id), "sql_database", session_id)
+
+    # State: WAITING FOR VENUE - DISTRICT
+    if current_state == STATE_WAIT_VENUE_DISTRICT:
+        return create_api_response(search_venue_by_level('DISTRICT', user_query, session_id), "sql_database", session_id)
+
+    # State: WAITING FOR VENUE - ASSEMBLY
+    if current_state == STATE_WAIT_VENUE_ASSEMBLY:
+         return create_api_response(search_venue_by_level('ASSEMBLY', user_query, session_id), "sql_database", session_id)
+
+    # State: WAITING FOR VENUE - STATE
+    if current_state == "STATE_WAIT_VENUE_STATE": # If we define this state
+         return create_api_response(search_venue_by_level('STATE', user_query, session_id), "sql_database", session_id)
+
+
+    # State: WAITING FOR LOCATION
+    if current_state == STATE_WAIT_LOCATION:
+        loc_name = user_query
+        print(f"⚡ Intent: Menu Location Lookup ({loc_name})")
+        # Keep state to allow checking another location
+        
+        try:
+            res = get_geo_details(loc_name)
+            if res:
+                t = res['type']
+                d = res['data']
+                txt = f"### 📍 Location Found: {d.get('vill_nm') or d.get('mandal_nm') or d.get('dist_nm')}\n"
+                txt += f"**Type:** {t}\n"
+                if t == 'Village':
+                    txt += f"**Mandal:** {d.get('parent_mandal')}\n"
+                    txt += f"**District:** {d.get('parent_district')}"
+                elif t == 'Mandal':
+                    txt += f"**District:** {d.get('parent_district')}"
+                
+                txt += "\n\nType another location to check, or 'Back'."
+                return create_api_response(txt, "sql_database", session_id)
+            else:
+                return create_api_response(get_msg("MSG_LOC_NOT_FOUND", session_id, name=loc_name), "sql_database", session_id)
+        except Exception as e:
+            return create_api_response(f"Error looking up location: {str(e)}", "error", session_id)
+
+    # State: WAITING FOR SPORT (SCHEDULE)
+    if current_state == STATE_WAIT_SPORT_SCHEDULE:
+        sport_name = user_query
+        print(f"⚡ Intent: Menu Sport Schedule ({sport_name})")
+        # REMOVED RESET: Allow continuous querying (e.g. Cricket then Kabaddi)
+        # if session_id: SESSION_STATE[session_id] = MENU_SCHEDULE
+        
+        try:
+             from rag.sql_queries import get_discipline_info
+             info = get_discipline_info(sport_name)
+             if info:
+                 game_id = info['game_id']
+                 disp_name = info['dist_game_nm']
+                 url = f"https://satg.telangana.gov.in/cmcup/viewschedulegames/{game_id}"
+                 txt = f"🗓️ **Schedule for {disp_name}**\n\n"
+                 txt += f"You can view the specific schedule and fixtures here:\n"
+                 txt += f"👉 [View {disp_name} Schedule]({url})"
+                 return create_api_response(txt, "sql_database", session_id)
+             else:
+                 return create_api_response(get_msg("MSG_NO_SCHEDULE", session_id, name=sport_name), "sql_database", session_id)
+        except Exception as e:
+             return create_api_response(f"Error retrieving schedule: {str(e)}", "error", session_id)
+
+    # State: WAITING FOR SPORT (AGE CRITERIA)
+    if current_state == STATE_WAIT_SPORT_AGE:
+        sport_input = user_query
+        print(f"⚡ Intent: Age Criteria Lookup ({sport_input})")
+        
+        try:
+            rules = get_sport_rules(sport_input)
+            if rules:
+                txt = f"### 🎂 Age Criteria for {rules.get('sport_name')}\n\n"
+                txt += f"**Min Age:** {rules.get('min_age')} years\n"
+                txt += f"**Max Age:** {rules.get('max_age')} years\n"
+                txt += f"**Team Size:** {rules.get('team_size') or 'Individual'}\n"
+                txt += f"**Para Event:** {'Yes' if rules.get('is_para')=='1' else 'No'}\n\n"
+                txt += "Type another sport to check, or 'Back'."
+                return create_api_response(txt, "sql_database", session_id)
+            else:
+                return create_api_response(get_msg("MSG_NO_RULES", session_id, name=sport_input), "sql_database", session_id)
+        except Exception as e:
+            return create_api_response(f"Error looking up age rules: {e}", "error", session_id)
+
+
+    # State: WAITING FOR SPORT (RULES)
+    if current_state == STATE_WAIT_SPORT_RULES:
+        sport_name = user_query
+        print(f"⚡ Intent: Menu Sport Rules ({sport_name})")
+        
+        try:
+            rag_bot = get_or_init_rag_chain()
+            rag_bot = get_or_init_rag_chain()
+            
+            # Inject Language Instruction
+            lang_code = SESSION_DATA.get(session_id, {}).get('language', 'en')
+            lang_map = {"en": "English", "te": "Telugu", "hi": "Hindi"}
+            lang_name = lang_map.get(lang_code, "English")
+            
+            rag_query = f"What are the age limits, eligibility and team rules for {sport_name} in CM Cup 2025? Answer in {lang_name} language."
+            rag_resp = rag_bot.invoke({"question": rag_query})
+            rag_text = extract_plain_text(rag_resp.get('result', rag_resp))
+            return create_api_response(f"📜 **Rules for {sport_name}:**\n\n{rag_text}", "rag_chain", session_id)
+        except Exception as e:
+             return create_api_response(f"Error retrieving rules: {str(e)}", "error", session_id)
+
+    # State: WAITING FOR DISTRICT OFFICER
+    # State: WAITING FOR DISTRICT OFFICER / VENUE
+    if current_state in [STATE_WAIT_DIST_OFFICER, STATE_WAIT_VENUE_DISTRICT]:
+        district_name = user_query
+        # Strip NLQ keywords for better match
+        clean_dist = district_name.lower().replace("incharge", "").replace("officer", "").replace("district", "").strip()
+        print(f"⚡ Intent: District Officer Lookup ({clean_dist})")
+        
+        try:
+             # Lazy import for safety
+            from rag.location_search import search_district_officer
+            from rag.sql_queries import extract_district_from_query
+
+            # 1. Smart Extraction (Full Sentence Support)
+            extracted_dist = extract_district_from_query(user_query)
+            target_dist = extracted_dist if extracted_dist else clean_dist
+            
+            print(f"⚡ Intent: District Officer Lookup (Extracted: {extracted_dist}, Final: {target_dist})")
+
+            officer = search_district_officer(target_dist)
+            
+            if officer:
+                # IMPORTANT: Keep state in WAITING mode to allow sequential lookups (Issue 1)
+                # But we might want to allow "Back" to work. 
+                # If we keep STATE_WAIT_DIST_OFFICER, "Back" needs to be handled in main loop or here.
+                # "Back" is usually handled at top of process_user_query.
+                if session_id: SESSION_STATE[session_id] = current_state # Keep current state
+                
+                # Format output properly
+                txt = f"### 👮‍♂️ District Sports Officer - {officer.get('district_name')}\n\n"
+                txt += f"**Name:** {officer.get('special_officer_name')}\n"
+                txt += f"**Designation:** {officer.get('designation')}\n"
+                txt += f"**Contact:** {officer.get('contact_no')}\n\n"
+                txt += "Type another District Name or 'Back'."
+                return create_api_response(txt, "file_search", session_id)
+            else:
+                 # Keep state to try again
+                 if session_id: SESSION_STATE[session_id] = STATE_WAIT_DIST_OFFICER
+                 return create_api_response(get_msg("MSG_NO_DIST_OFFICER", session_id, district=clean_dist), "file_search", session_id)
+        except Exception as e:
+            return create_api_response(f"Error searching for district officer: {str(e)}", "error", session_id)
+
+    # State: WAITING FOR CLUSTER INCHARGE
+    # State: WAITING FOR CLUSTER INCHARGE / VENUE
+    if current_state in [STATE_WAIT_CLUSTER_INCHARGE, STATE_WAIT_VENUE_CLUSTER]:
+        cluster_name = user_query
+        print(f"⚡ Intent: Cluster In-Charge Lookup ({cluster_name})")
+        
+        try:
+            # Lazy import for safety
+            from rag.location_search import search_cluster_incharge
+            
+            # Correct function name
+            res = search_cluster_incharge(cluster_name)
+            
+            if res:
+                # Keep state in WAITING mode to allow sequential lookups
+                if session_id: SESSION_STATE[session_id] = current_state
+                
+                t = res.get('type', 'Cluster')
+                d = res.get('data', {})
+                
+                # Fetch Mandal Officer Details for the layout
+                mandal_name = d.get('mandal_name', '')
+                mandal_details = ""
+                
+                if mandal_name:
+                    try:
+                        from rag.location_search import search_mandal_incharge
+                        m_res = search_mandal_incharge(mandal_name)
+                        if m_res:
+                            mandal_details = f"\nMandal Officer Details:\nName: {m_res.get('incharge_name', 'N/A')}\nMobile: {m_res.get('mobile_no', 'N/A')}\n"
+                        else:
+                            mandal_details = f"\nMandal Officer Details:\nDetails not available for {mandal_name}\n"
+                    except Exception as e:
+                        print(f"Error fetching mandal details: {e}")
+                        mandal_details = "\nMandal Officer Details:\nError fetching details\n"
+
+                # Construct Response matching User Request
+                # Gram Panchayat / Cluster Level: Allikori
+                # Venue: ADILABAD
+                
+                cluster_display_name = d.get('clustername') or d.get('villagename') or cluster_name
+                venue_location = d.get('district_name') or "N/A" # User example showed District as Venue
+                
+                txt = f"Gram Panchayat / Cluster Level: {cluster_display_name}\n"
+                txt += f"Venue: {venue_location}\n\n"
+                
+                txt += "In-charge Details:\n"
+                txt += f"Name: {d.get('incharge_name', 'N/A')}\n"
+                txt += f"Mobile: {d.get('mobile_no', 'N/A')}\n"
+                
+                txt += mandal_details
+                
+                txt += "\nType another Cluster/Village Name or 'Back'."
+                return create_api_response(txt, "file_search", session_id)
+            else:
+                return create_api_response(f"ℹ️ No Venue In-Charge found for **{cluster_name}**. Please check the spelling or try another cluster.\n\nType another cluster or 'Back'.", "file_search", session_id)
+        except Exception as e:
+            return create_api_response(f"Error searching for cluster in-charge: {str(e)}", "error", session_id)
+
+    # State: WAITING FOR MANDAL INCHARGE
+    # State: WAITING FOR MANDAL INCHARGE / VENUE
+    if current_state in [STATE_WAIT_MANDAL_INCHARGE, STATE_WAIT_VENUE_MANDAL]:
+        mandal_name = user_query
+        print(f"⚡ Intent: Mandal In-Charge Lookup ({mandal_name})")
+        
+        try:
+            # Lazy import
+            from rag.location_search import search_mandal_incharge
+            
+            res = search_mandal_incharge(mandal_name)
+            
+            if res:
+                # Keep state in WAITING mode to allow sequential lookups
+                if session_id: SESSION_STATE[session_id] = current_state
+                
+                txt = f"### 🏫 Mandal In-Charge (MEO) - {res.get('mandal_name')}\n\n"
+                txt += f"**Name:** {res.get('incharge_name')}\n"
+                txt += f"**District:** {res.get('district_name')}\n"
+                txt += f"**Mobile:** {res.get('mobile_no', 'N/A')}\n\n"
+                txt += "Type another Mandal Name or 'Back'."
+                return create_api_response(txt, "file_search", session_id)
+            else:
+                return create_api_response(f"ℹ️ No Mandal In-Charge found for **{mandal_name}**. Please check the spelling or try another mandal.\n\nType another mandal or 'Back'.", "file_search", session_id)
+        except Exception as e:
+            return create_api_response(f"Error searching for mandal in-charge: {str(e)}", "error", session_id)
+
+    # State: WAITING FOR ASSEMBLY (Placeholder)
+    if current_state == STATE_WAIT_VENUE_ASSEMBLY:
+        return create_api_response("ℹ️ **Assembly Constituency Level** data is coming soon.\n\nPlease check back later or try another level.", "static_info", session_id)
+
+    # State Handling Logic
+    if user_query.isdigit():
+        choice = int(user_query)
+        
+        if current_state == MENU_MAIN:
+            if choice == 1:
+                # Registration & Eligibility
+                if session_id: SESSION_STATE[session_id] = MENU_REG_FAQ
+                return create_api_response(get_menu_data(MENU_REG_FAQ, session_id), "menu_system", session_id)
+            elif choice == 2:
+                # Sports & Matches -> Submenu
+                if session_id: SESSION_STATE[session_id] = MENU_GROUP_SPORTS
+                return create_api_response(get_menu_data(MENU_GROUP_SPORTS, session_id), "menu_system", session_id)
+            elif choice == 3:
+                # Venues & Officials -> Submenu
+                if session_id: SESSION_STATE[session_id] = MENU_GROUP_VENUES
+                return create_api_response(get_menu_data(MENU_GROUP_VENUES, session_id), "menu_system", session_id)
+            elif choice == 4:
+                # Player Status
+                if session_id: SESSION_STATE[session_id] = MENU_PLAYER_STATUS
+                return create_api_response(get_menu_data(MENU_PLAYER_STATUS, session_id), "menu_system", session_id)
+            elif choice == 5:
+                # Help & Language -> Submenu
+                if session_id: SESSION_STATE[session_id] = MENU_GROUP_HELP
+                return create_api_response(get_menu_data(MENU_GROUP_HELP, session_id), "menu_system", session_id)
+        
+
+        # --- INTERMEDIATE GROUPS ---
+        elif current_state == MENU_GROUP_SPORTS:
+            if choice == 1:
+                if session_id: SESSION_STATE[session_id] = MENU_DISCIPLINES
+                return create_api_response(get_menu_data(MENU_DISCIPLINES, session_id), "menu_system", session_id)
+            elif choice == 2:
+                if session_id: SESSION_STATE[session_id] = MENU_SCHEDULE
+                return create_api_response(get_menu_data(MENU_SCHEDULE, session_id), "menu_system", session_id)
+            elif choice == 3:
+                if session_id: SESSION_STATE[session_id] = MENU_MEDALS
+                return create_api_response(get_menu_data(MENU_MEDALS, session_id), "menu_system", session_id)
+
+        elif current_state == MENU_GROUP_VENUES:
+            # 1. Venues, 2. Dist Officers, 3. Cluster In-Charge
+            if choice == 1:
+                # LIST VENUES (Menu 3.1) - Dynamic Data
+                from rag.data_store import get_datastore
+                ds = get_datastore()
+                if not ds.initialized: ds.init_db()
+                
+                # Query distinct venues
+                lang = SESSION_DATA.get(session_id, {}).get("language", "en")
+                df = ds.query("SELECT DISTINCT venue FROM tb_fixtures WHERE venue IS NOT NULL AND venue != ''")
+                
+                if not df.empty:
+                    venues = [v['venue'] for v in df.to_dict(orient="records")]
+                    venues = sorted(list(set([v.strip() for v in venues if v and str(v).lower() != 'nan'])))
+                    
+                    if not venues:
+                         return create_api_response("ℹ️ No specific venue names are currently listed in the schedule.", "sql_database", session_id)
+                         
+                    txt = get_translation("TXT_VENUE_LIST_HEADER", lang)["text"]
+                    for v in venues[:50]:
+                        txt += f"• **{v}**\n"
+                    
+                    txt += "\nType a **Venue Name** or 'Back'."
+                    return create_api_response(txt, "sql_database", session_id)
+                else:
+                    return create_api_response("ℹ️ No venue information found in the schedule database.", "sql_database", session_id)
+            elif choice == 2:
+                 try:
+                     if session_id: SESSION_STATE[session_id] = current_state
+                     return create_api_response(get_menu_data("MENU_OFFICERS_DISTRICT", session_id), "menu_system", session_id)
+                 except Exception as e:
+                     print(f"CRASH in Option 2: {e}")
+                     return create_api_response(f"❌ Error loading District Officers menu: {str(e)}", "error_handler", session_id)
+            elif choice == 3:
+                 try:
+                     if session_id: SESSION_STATE[session_id] = STATE_WAIT_CLUSTER_INCHARGE
+                     return create_api_response(get_menu_data("MENU_OFFICERS_CLUSTER", session_id), "menu_system", session_id)
+                 except Exception as e:
+                     print(f"CRASH in Option 3: {e}")
+                     return create_api_response(f"❌ Error loading Venue In-Charge menu: {str(e)}", "error_handler", session_id)
+            elif choice == 4:
+                 try:
+                     if session_id: SESSION_STATE[session_id] = STATE_WAIT_MANDAL_INCHARGE
+                     return create_api_response(get_menu_data("MENU_OFFICERS_MANDAL", session_id), "menu_system", session_id)
+                 except Exception as e:
+                     print(f"CRASH in Option 4: {e}")
+                     return create_api_response(f"❌ Error loading Mandal In-Charge menu: {str(e)}", "error_handler", session_id)
+        
+        elif current_state == MENU_GROUP_HELP:
+             lang = SESSION_DATA.get(session_id, {}).get("language", "en")
+             if choice == 1:
+                 # Helpline Numbers
+                 return create_api_response(get_translation("TXT_HELPLINE_ANSWER", lang), "static_info", session_id)
+             elif choice == 2:
+                 # Email Support
+                 return create_api_response(get_translation("TXT_EMAIL_ANSWER", lang), "static_info", session_id)
+             elif choice == 3:
+                 if session_id: SESSION_STATE[session_id] = MENU_LANGUAGE
+                 return create_api_response(get_menu_data(MENU_LANGUAGE, session_id), "menu_system", session_id)
+
+        if current_state == MENU_OFFICERS:
+            # Deprecated direct access but keeping compliant just in case
+            pass
+        
+        # --- SUB MENU: LANGUAGE ---
+        elif current_state == MENU_LANGUAGE:
+            lang_set = False
+            
+            if choice == 1:
+                # Set to English
+                if session_id: 
+                    if session_id not in SESSION_DATA: SESSION_DATA[session_id] = {}
+                    SESSION_DATA[session_id]["language"] = "en"
+                lang_set = True
+            elif choice == 2:
+                # Set to Telugu
+                if session_id:
+                    if session_id not in SESSION_DATA: SESSION_DATA[session_id] = {}
+                    SESSION_DATA[session_id]["language"] = "te"
+                lang_set = True
+            elif choice == 3:
+                # Set to Hindi
+                if session_id:
+                    if session_id not in SESSION_DATA: SESSION_DATA[session_id] = {}
+                    SESSION_DATA[session_id]["language"] = "hi"
+                lang_set = True
+            else:
+                return create_api_response("❌ Invalid Option. Please select 1, 2, or 3.", "menu_system", session_id)
+            
+            # Auto-Redirect to Main Menu if language changed
+            if lang_set:
+                if session_id: SESSION_STATE[session_id] = MENU_MAIN
+                # Get Main Menu Data in new language
+                menu_data = get_menu_data(MENU_MAIN, session_id)
+                return create_api_response(menu_data, "menu_system", session_id)
+
+        
+
+        # --- SUB MENU: SELECT SPORT (Drill Down) ---
+        elif current_state == MENU_SELECT_SPORT:
+            data = SESSION_DATA.get(session_id, {})
+            sports = data.get("sports", [])
+            
+            # Check if valid index
+            if 1 <= choice <= len(sports):
+                selected_sport = sports[choice - 1]
+                
+                # Store selected sport
+                if session_id:
+                     SESSION_STATE[session_id] = MENU_GAME_OPTIONS
+                     SESSION_DATA[session_id]["selected_sport"] = selected_sport
+                
+                # Dynamic Buttons for Game Options
+                buttons = [
+                    {"name": get_msg("TXT_BTN_AGE_CRITERIA", session_id), "value": "1"},
+                    {"name": get_msg("TXT_BTN_GAME_EVENTS", session_id), "value": "2"},
+                ]
+                
+                txt = get_msg("TXT_GAME_OPTIONS_HEADER", session_id, sport=selected_sport)
+                
+                return create_api_response({
+                    "text": txt,
+                    "buttons": buttons
+                }, "menu_system", session_id)
+            else:
+                 return {"response": "❌ Invalid Option. Please select a number from the list above.", "source": "validation_error"}
+
+        # --- SUB MENU: GAME OPTIONS (Age, Events, Rules) ---
+        elif current_state == MENU_GAME_OPTIONS:
+            data = SESSION_DATA.get(session_id, {})
+            selected_sport = data.get("selected_sport", "Unknown Sport")
+            
+            from rag.sql_queries import get_discipline_info, get_categories_by_sport
+            
+            info = get_discipline_info(selected_sport)
+            game_id = info['game_id'] if info else None
+
+            if choice == 1: # Age Criteria
+                if not game_id:
+                     return create_api_response(f"ℹ️ No detailed age info found for **{selected_sport}**.", "sql_database", session_id)
+                
+                cats = get_categories_by_sport(game_id)
+                if cats:
+                     txt = f"### 🎂 Age Criteria for {selected_sport}\n\n"
+                     for c in cats:
+                         gender_map = {1: "Male", 2: "Female"}
+                         g_str = gender_map.get(c['gender'], "Open")
+                         txt += f"- **{c['cat_name']}** ({g_str}): {c['from_age']} - {c['to_age']} Years\n"
+                     return create_api_response(txt, "sql_database", session_id)
+                else:
+                     return create_api_response(f"ℹ️ No specific age categories found for **{selected_sport}**.", "sql_database", session_id)
+
+            elif choice == 2: # Events
+                if not game_id:
+                     return create_api_response("ℹ️ Link not available.", "error", session_id)
+                
+                url = f"https://satg.telangana.gov.in/cmcup/showDisciplineEvents/{game_id}"
+                return create_api_response(
+                    f"🏆 **Events for {selected_sport}**\n\nPlease visit the official link below to view all events:\n👉 [View Events for {selected_sport}]({url})",
+                    "static_link",
+                    session_id
+                )
+
+            elif choice == 3: # Rules
+                 return create_api_response(get_msg("TXT_RULES_UPDATE_PENDING", session_id), "static_placeholder", session_id)
+
+        # --- SUB MENU: REGISTRATION ---
+        # --- SUB MENU: REGISTRATION (PLAYER DETAILS) ---
+        # --- SUB MENU: PLAYER STATUS ---
+        elif current_state == MENU_PLAYER_STATUS:
+            lang = SESSION_DATA.get(session_id, {}).get("language", "en")
+            if choice == 1:
+                # Search by Phone No
+                # Auto-lookup if phone_number is available (WhatsApp flow)
+                # Robust extraction: Get last 10 digits if they match Indian mobile pattern
+                extracted_phone = None
+                if phone_number:
+                    p_digits = re.sub(r'\D', '', phone_number)
+                    if len(p_digits) >= 10:
+                        potential = p_digits[-10:]
+                        if re.match(r'[6-9]\d{9}', potential):
+                            extracted_phone = potential
+
+                if extracted_phone:
+                    print(f"⚡ WhatsApp Auto-Lookup for Phone: {extracted_phone}")
+                    
+                    if session_id: SESSION_STATE[session_id] = MENU_PLAYER_STATUS
+                    
+                    registrations = get_player_venues_by_phone(extracted_phone)
+                    if registrations:
+                        txt = format_registrations(registrations, session_id)
+                        return create_api_response(txt, "sql_database", session_id)
+                    else:
+                        return create_api_response(get_msg("ERR_NO_REGISTRATION", session_id, phone=extracted_phone), "sql_database", session_id)
+
+                if session_id: SESSION_STATE[session_id] = STATE_WAIT_PHONE
+                return create_api_response(get_translation("TXT_PLAYER_STATUS_PHONE_PROMPT", lang), "menu_system", session_id)
+            elif choice == 2:
+                # Search by Acknowledgment No
+                if session_id: SESSION_STATE[session_id] = STATE_WAIT_ACK
+                return create_api_response(get_translation("TXT_PLAYER_STATUS_ACK_PROMPT", lang), "menu_system", session_id)
+
+        # --- SUB MENU: DISCIPLINES ---
+        elif current_state == MENU_DISCIPLINES:
+            level_map = {1: "cluster", 2: "mandal", 3: "assembly", 4: "district", 5: "state"}
+            if choice in level_map:
+                resp = get_discipline_response(choice, session_id)
+                if resp:
+                    return resp
+                else:
+                     return create_api_response("ℹ️ No sports found for this level.", "sql_database", session_id)
+        
+        # --- SUB MENU: REG FAQ ---
+        elif current_state == MENU_REG_FAQ:
+            lang = SESSION_DATA.get(session_id, {}).get("language", "en")
+            
+            if choice == 1: # How to Register
+                return create_api_response(get_translation("TXT_REG_HOWTO", lang), "static", session_id)
+            elif choice == 2: # Eligibility Rules
+                return create_api_response(get_translation("TXT_REG_RULES", lang), "static", session_id)
+            elif choice == 3: # Documents
+                return create_api_response(get_translation("TXT_REG_DOCS", lang), "static", session_id)
+            elif choice == 4: # Registration Status
+                 return create_api_response(get_translation("TXT_REG_STATUS", lang), "redirect", session_id)
+            elif choice == 5: # FAQs
+                 return create_api_response(get_translation("TXT_REG_FKQ", lang), "static", session_id)
+
+        
+
+        # --- SUB MENU: SCHEDULE ---
+        # --- SUB MENU: SCHEDULE ---
+        elif current_state == MENU_SCHEDULE:
+            lang = SESSION_DATA.get(session_id, {}).get("language", "en")
+            if choice == 1:
+                # Tournament Schedule (Localized)
+                return create_api_response(
+                    get_translation("TXT_TOURNAMENT_SCHEDULE", lang),
+                    "static_data",
+                    session_id
+                )
+            elif choice == 2:
+                # Games Schedule (Game Search)
+                if session_id: SESSION_STATE[session_id] = MENU_SCHEDULE_GAME_SEARCH
+                return create_api_response(
+                    get_translation("TXT_SCHEDULE_GAME_SEARCH_PROMPT", lang),
+                    "menu_system",
+                    session_id
+                )
+
+        # --- SUB MENU: SCHEDULE GAME SEARCH (TEXT INPUT) ---
+        elif current_state == MENU_SCHEDULE_GAME_SEARCH:
+             pass 
+             
+        # --- SUB MENU: OFFICERS ---
+        elif current_state == MENU_OFFICERS:
+            if choice == 1:
+                 if session_id: SESSION_STATE[session_id] = STATE_WAIT_DIST_OFFICER
+                 return create_api_response(get_menu_data("MENU_OFFICERS_DISTRICT", session_id), "menu_system", session_id)
+            elif choice == 2:
+                 if session_id: SESSION_STATE[session_id] = STATE_WAIT_CLUSTER_INCHARGE
+                 return create_api_response(get_menu_data("MENU_OFFICERS_CLUSTER", session_id), "menu_system", session_id)
+
+
+
+
+        # Catch-all for invalid numbers in a menu context
+        return create_api_response("❌ Invalid Option. Please select a valid number from the menu or type 'Back'.", "menu_system", session_id)
+
+    # ------------------------------------------------
+    # END MENU MACHINE (DIGIT HANDLING)
+    # ------------------------------------------------
+
+    if current_state == MENU_REG_FAQ and not user_query.isdigit():
+        # Check for sport rules lookup
+
+        rules = get_sport_rules(user_query)
+        if rules:
+            txt = f"### 🎂 Age Criteria for {rules.get('sport_name')}\n\n"
+            txt += f"**Min Age:** {rules.get('min_age')} years\n"
+            txt += f"**Max Age:** {rules.get('max_age')} years\n"
+            txt += f"**Team Size:** {rules.get('team_size') or 'Individual'}\n"
+            txt += f"**Para Event:** {'Yes' if rules.get('is_para')=='1' else 'No'}\n\n"
+            txt += "Type another sport to check, or 'Back'."
+            return create_api_response(txt, "sql_database", session_id)
+        else:
+             pass 
+
+    # --- TEXT INPUT HANDLING FOR MENUS ---
+    if current_state == MENU_SCHEDULE_GAME_SEARCH and not user_query.isdigit():
+        from rag.sql_queries import get_discipline_info
+        info = get_discipline_info(user_query)
+        
+        if info:
+             game_id = info['game_id']
+             game_name = info['dist_game_nm']
+             url = f"https://satg.telangana.gov.in/cmcup/viewschedulegames/{game_id}"
+             txt = f"🗓️ **Schedule for {game_name}**\n\n"
+             txt += f"You can view the specific schedule and fixtures here:\n"
+             txt += f"👉 [View {game_name} Schedule]({url})"
+             return create_api_response(txt, "sql_database", session_id)
+        else:
+             # Fallthrough to RAG if not found (Hybrid Mode)
+             print(f"⚠️ Game '{user_query}' not found via specific search. Falling back to Hybrid RAG.")
+             pass
+
+    # --- SUB MENU: VENUES (Text Input or Direct) ---
+    # Note: If MENU_VENUES was entered via button and has no further input state, it might fall through here.
+    # But usually MENU_VENUES is handled in the digit section if it has sub-options.
+    # If it's a leaf node that just displays info, it should be handled in the digit section above.
+    # Let's check where MENU_VENUES (Menu 3.1) is handled.
+    # It is currently handled in the digit section? No, it was just a PLACEHOLDER in previous code.
+    # We need to find the block for MENU_GROUP_VENUES -> Choice 1 (Venues).
+
+    if current_state == MENU_OFFICERS and not user_query.isdigit():
+        # User entered cluster name?
+        # Ensure import exists
+        from rag.location_search import search_cluster_incharge
+        result = search_cluster_incharge(user_query)
+        if result:
+            return create_api_response(result, "local_data_file", session_id)
+        else:
+             # Fallthrough to RAG if not found (Hybrid Mode)
+             print(f"⚠️ Cluster '{user_query}' not found via specific search. Falling back to Hybrid RAG.")
+             pass
+
+    # --- SUB MENU: VENUES (Text Input) ---
+    if current_state == MENU_VENUES and not user_query.isdigit():
+        pass
+
+            
+    
+    # ------------------------------------------------
+    # END MENU MACHINE -> FALLTHROUGH TO LOGIC
+    # ------------------------------------------------
+
+    # 0. Static Data Interceptor
+    # 0.1 Year/Version Mismatch Interceptor (High Priority)
+    # If user asks for past years (e.g. 2015, 2024), redirect to 2025.
+    year_match = re.search(r'\b(20\d{2})\b', user_query)
+    if year_match:
+        year = int(year_match.group(1))
+        if year != 2025 and ("cm" in user_query or "cup" in user_query):
+             return create_api_response(
+                 f"ℹ️ **Note:** I currently only have information for the **Key Minister's Cup (CM Cup) 2025**. I don't have data for {year}.",
+                 "logic_interceptor",
+                 session_id
+             )
+
+    # 0.2 ...
+    pass
+
+    # 0.4 Age / Rules Lookup Interceptor
+    # ...
+    # ...
+    # Fix for Crash: Ensure variable exists
+    detected_sport = None
+    if detected_sport and detected_sport not in ignored_sports and len(detected_sport) > 2:
+        try:
+            rules = get_sport_rules(detected_sport)
+            if rules:
+                txt = f"### 🎂 Age Criteria for {rules.get('sport_name')}\n\n"
+                txt += f"**Min Age:** {rules.get('min_age')} years\n"
+                txt += f"**Max Age:** {rules.get('max_age')} years\n"
+                txt += f"**Team Size:** {rules.get('team_size') or 'Individual'}\n"
+                txt += f"**Level:** {rules.get('level', 'N/A')}\n"
+                txt += f"**Para Event:** {'Yes' if rules.get('is_para')=='1' else 'No'}\n\n"
+                txt += "Type 'Rules' for more details or another sport name."
+                return create_api_response(txt, "sql_interceptor", session_id)
+        except Exception as e:
+            print(f"Error in Age Interceptor: {e}")
+
+    # 0.5 Participation Stats (New)
+    stats_keywords = ["how many", "participation", "players", "registered", "total count", "status"]
+    rule_exclusions = ["rule", "age", "criteria", "terms", "condition"]
+    
+    if any(k in user_query for k in stats_keywords) and not any(e in user_query for e in rule_exclusions):
+
+        count = get_participation_stats()
+        return create_api_response(
+            f"📊 **Participation Status:**\n\nA total of **{count} players** have registered for the Chief Minister's Cup (CM Cup) 2025 so far!",
+            "sql_database",
+            session_id
+        )
+
+    # 1. Phone Number match - PRIVACY WARNING
+
+    # --- NLQ INTERCEPTOR: DISTRICT INCHARGE ---
+    # Detects: "incharge for warangal", "khammam district officer", "who is ... for nalgonda"
+    officer_keywords = ["incharge", "in-charge", "officer", "dso", "district sports officer"]
+    if any(kw in user_query for kw in officer_keywords) and ("for" in user_query or "of" in user_query or "district" in user_query):
+        # Extract potential location name
+        # Strategy: Look for words that are NOT keywords. 
+        # Simple heuristic: Split by 'for', 'of', 'in' and take the noun.
+        # Better: Use known district list or try full query match by removing keywords.
+        
+        clean_q = user_query
+        for kw in officer_keywords:
+            clean_q = clean_q.replace(kw, "")
+        clean_q = clean_q.replace("who is the", "").replace("who is", "").replace("details", "").replace("district", "")
+        clean_q = clean_q.strip(" ?.!").lower()
+        
+        # Split by common prepositions if present
+        if " for " in clean_q:
+            clean_q = clean_q.split(" for ")[-1]
+        elif " of " in clean_q:
+             clean_q = clean_q.split(" of ")[-1]
+        elif " in " in clean_q:
+             clean_q = clean_q.split(" in ")[-1]
+            
+        target_loc = clean_q.strip()
+        
+        if len(target_loc) > 3: # Avoid extremely short noise like "me"
+            from rag.location_search import search_district_officer
+            officer = search_district_officer(target_loc)
+            
+            if officer:
+                txt = f"### 👮‍♂️ District Sports Officer - {officer.get('district_name')}\n\n"
+                txt += f"**Name:** {officer.get('special_officer_name')}\n"
+                txt += f"**Designation:** {officer.get('designation')}\n"
+                txt += f"**Contact:** {officer.get('contact_no')}\n"
+                return create_api_response(txt, "nlq_interceptor", session_id)
+
+    # 0.6 Registration/Ack Number Link
+    if "acknowledgment number" in user_query or "acknowledgement number" in user_query or "ack number" in user_query or "ack no" in user_query:
+        if "what is" in user_query or "download" in user_query or "get" in user_query:
+            return create_api_response(
+                "📥 **Download Acknowledgment:**\n\nYou can find and download your Acknowledgment Number from the official website:\n\n👉 [Download Enrollment Acknowledgment](https://satg.telangana.gov.in/cmcup/downloadack)",
+                "static_rule",
+                session_id
+            )
+
+    # 1. Phone Number match - PRIVACY GUARD & VENUE FLOW
+    original_query = raw_query.strip() # Keep casing for Reg IDs if needed
+    
+    # Define venue intent keywords (Fix for NameError)
+    venue_keywords = ["venue", "status", "application", "check", "where", "game status", "match status"]
+    venue_intent = any(k in user_query for k in venue_keywords)
+
+    # Relaxed regex to catch numbers even with country codes (e.g. 9198480...)
+    phone_match = re.search(r'\b(?:91)?([6-9]\d{9})\b', original_query)
+    # If using capture group, extract it
+    if phone_match:
+        phone = phone_match.group(1) if phone_match.lastindex else phone_match.group(0)
+    else:
+        phone = None
+    
+    # 1A. Venue/Status Flow (Exception to Filter)
+    # 1A. Venue/Status Flow (Implicit if phone number provided)
+    # venue_intent is now optional if phone number is present
+    
+    if phone:
+        # phone is already extracted above
+        print(f"⚡ Intent: Venue Lookup via Phone ({phone})")
+        
+        # SQL Lookup
+        registrations = get_player_venues_by_phone(phone)
+        
+        if registrations:
+            txt = format_registrations(registrations, session_id)
+            return create_api_response(txt, "sql_database", session_id)
+        else:
+             return create_api_response(f"ℹ️ No registrations found for **{phone}**. Please check the number or register at the official site.", "sql_database", session_id)
+    
+    # 1C. Venue Intent BUT NO Phone -> Prompt
+    # If user mentions venue/status/game but didn't provide phone, prompt them.
+    # We use a broad check but ensure it's not a general question like "Where is the venue for Cricket?" (which might be generic).
+    # Heuristic: If query is short OR has "my/check", prompt.
+    if venue_intent:
+        words = user_query.split()
+        # Exclude general queries about levels, dates, or schedule
+        is_general_query = any(k in user_query for k in ["level", "date", "when", "schedule", "time", "mandal", "district", "cluster", "state", "village", "gram", "panchayat"])
+        
+        if (len(words) < 8 or "my" in user_query or "check" in user_query or "know" in user_query) and not is_general_query:
+             return {
+                 "response": "To check your **Venue** or **Game Status**, please provide your registered **Phone Number**.\n\nExample: *Venue details for 9848012345*",
+                 "source": "logic_interceptor"
+             }
+
+    # 2. Registration ID / Ack No -> Venue Lookup
+    ack_match = re.search(r'\b(SATGCMC(?:\d+)?-\d+)\b', original_query, re.IGNORECASE)
+    if ack_match:
+        ack_no = ack_match.group(1).upper()
+        if venue_intent or True: # Always treat Ack No as a lookup request now? Or only if venue intent? User said "Venue Details - Based on Acknowledgement Details". Let's assume lookup.
+             print(f"⚡ Intent: Ack No Lookup ({ack_no})")
+             rec = get_player_venue_by_ack(ack_no)
+             if rec:
+                venue = rec.get('venue')
+                sport = rec.get('sport_name') or rec.get('event_name')
+                
+                # Parse Level
+                # Parse Level
+                level_str = get_msg("TXT_LEVEL_CLUSTER", session_id) or "Cluster/Village Level"
+                if rec.get('is_state_level') == '1': level_str = get_msg("TXT_SELECTED_STATE", session_id)
+                elif rec.get('is_district_level') == '1': level_str = get_msg("TXT_SELECTED_DISTRICT", session_id)
+                elif rec.get('is_mandal_level') == '1': level_str = get_msg("TXT_SELECTED_MANDAL", session_id)
+                
+                txt = get_msg("MSG_PLAYER_FOUND_HEADER", session_id)
+                txt += f"{get_msg('TXT_LABEL_NAME', session_id)} {rec.get('player_nm', 'N/A')}\n"
+                txt += f"{get_msg('TXT_LABEL_REG_ID', session_id)} {rec.get('player_reg_id', ack_no)}\n\n"
+                
+                # Format Location (Remove None/N/A)
+                loc_parts = [
+                    rec.get('villagename'),
+                    rec.get('mandalname'),
+                    rec.get('districtname')
+                ]
+                # Filter out None, 'None', 'N/A' and join
+                clean_locs = [l for l in loc_parts if l and l.lower() not in ['none', 'n/a', '']]
+                location_str = ", ".join(clean_locs) if clean_locs else "Location Pending"
+
+                txt += f"{get_msg('TXT_LABEL_LOCATION', session_id)} {location_str}\n"
+                txt += f"{get_msg('TXT_LABEL_STATUS', session_id)} {level_str}\n\n"
+                
+                txt += f"{get_msg('TXT_LABEL_VENUE_DETAILS', session_id)}\n"
+                txt += f"{get_msg('TXT_LABEL_SPORT', session_id)} {sport}\n"
+                if venue:
+                    txt += f"{get_msg('TXT_LABEL_VENUE', session_id)} {venue}\n"
+                    txt += f"{get_msg('TXT_LABEL_DATE', session_id)} {rec.get('match_date') or get_msg('TXT_CHECK_SCHEDULE', session_id)}\n"
+                else:
+                    txt += f"{get_msg('TXT_LABEL_VENUE', session_id)} {get_msg('TXT_NOT_ASSIGNED', session_id)}\n"
+                    
+                txt += f"\n{get_msg('TXT_LABEL_COACH', session_id)}\n"
+                
+                # HYBRID LOGIC: If SQL returns None for Incharge, ask RAG
+                incharge_name = rec.get('cluster_incharge')
+                incharge_contact = rec.get('incharge_mobile')
+                
+                if not incharge_name and rec.get('districtname'):
+                    print("⚠️ Hybrid Trigger: SQL missing Incharge. Asking RAG...")
+                    try:
+                        rag_bot = get_or_init_rag_chain()
+                        sport_detail = rec.get('sport_name') or rec.get('event_name') or "sports"
+                        
+                        # Use available hierarchy for RAG
+                        rag_query = f"Who is the {sport_detail} incharge for "
+                        if rec.get('mandalname'): rag_query += f"Mandal: {rec.get('mandalname')}, "
+                        if rec.get('districtname'): rag_query += f"District: {rec.get('districtname')}?"
+                        
+                        # Pass Language to RAG!
+                        lang_code = SESSION_DATA.get(session_id, {}).get('language', 'en')
+                        lang_map = {"en": "English", "te": "Telugu", "hi": "Hindi"}
+                        lang_name = lang_map.get(lang_code, "English")
+                        
+                        input_payload = {"question": rag_query, "language": lang_name}
+                        rag_resp = rag_bot.invoke(input_payload)
+                        
+                        # Extract simple text from chain response
+                        # rag_text = rag_resp.get('result', str(rag_resp)) if isinstance(rag_resp, dict) else str(rag_resp)
+                        rag_text = extract_plain_text(rag_resp)
+                        
+                        # Filter out generic 'not found' messages to keep UI clean
+                        if "couldn't find" in rag_text.lower() or "not available" in rag_text.lower():
+                             txt += f"{get_msg('TXT_LABEL_STATUS', session_id)} {get_msg('TXT_STATUS_ASSIGNED', session_id)}\n"
+                        else:
+                             txt += f"*{get_msg('TXT_RETRIEVED_AI', session_id)}*: {rag_text}\n"
+
+                    except Exception as e:
+                        print(f"Hybrid RAG Failed: {e}")
+                        txt += f"{get_msg('TXT_LABEL_STATUS', session_id)} {get_msg('TXT_CONTACT_HELPDESK', session_id)}\n"
+                else:
+                    txt += f"Name: {incharge_name or 'N/A'}\n"
+                    txt += f"{get_msg('TXT_LABEL_CONTACT', session_id)} {incharge_contact or 'N/A'}\n"
+                
+                
+                return create_api_response(txt, "sql_database", session_id)
+             else:
+                 # Explicit fallback if ID not found in DB
+                 return create_api_response(
+                     f"ℹ️ We couldn't find any details for Acknowledgment Number **{ack_no}**.\n\nPlease check the number and try again, or contact your District Sports Officer if you believe this is an error.", 
+                     "sql_database_fallback", 
+                     session_id
+                 )
+
+
+    # 2. Registration ID - REMOVED
+    # Player lookup by Reg ID is disabled for privacy reasons.
+    # Fallthrough to RAG/General Logic.
+
+
+    # 3. Match/Fixture ID
+    match_match = re.search(r'(?:match|fixture)\s*(?:id|no)?\s*[:#-]?\s*(\d+)', original_query, re.IGNORECASE)
+    if match_match:
+        fid = match_match.group(1)
+        print(f"⚡ Intent: Fixture Lookup (ID: {fid})")
+        try:
+            res = get_fixture_details(fid)
+            if res:
+                txt = f"### 🏟️ Match Details (ID: {res['fixture_id']})\n"
+                txt += f"**Match No:** {res['match_no']}\n"
+                txt += f"**Venue:** {res['venue']}\n"
+                txt += f"**Teams:** {res.get('team1_name', 'TBD')} vs {res.get('team2_name', 'TBD')}\n"
+                txt += f"**Date:** {res['match_date']} ({res['match_day']}) @ {res['match_time']}\n"
+                txt += f"**Round:** {res['round_name']}"
+                return create_api_response(txt, "sql_database", session_id)
+            else:
+                 return create_api_response(get_msg("MSG_NO_MATCH_ID", session_id, id=fid), "sql_database", session_id)
+        except Exception as e:
+            print(f"SQL Error: {e}")
+    sport_pattern_1 = r'(?:schedule|events|matches)\s*(?:for|of|in)?\s*([a-zA-Z\s]+)'
+    sport_pattern_2 = r'([a-zA-Z\s]+?)\s*(?:schedule|events|matches)'
+    
+    sport_match_objs = []
+    m1 = re.search(sport_pattern_1, original_query, re.IGNORECASE)
+    m2 = re.search(sport_pattern_2, original_query, re.IGNORECASE)
+    
+    # Prioritize "Schedule for Sport" if both somehow match, otherwise "Sport Schedule"
+    sport_match = m1 if m1 else m2
+    
+    if sport_match:
+        raw_sport = sport_match.group(1).strip()
+        clean_sport = re.sub(r'\s+(matches|events|schedule|today|tomorrow)\b', '', raw_sport, flags=re.IGNORECASE).strip()
+        if clean_sport.lower() not in ["the", "this"] and len(clean_sport) > 3:
+             print(f"⚡ Intent: Sport Schedule ({clean_sport})")
+             try:
+                 from rag.sql_queries import get_discipline_info
+                 info = get_discipline_info(clean_sport)
+                 if info:
+                     game_id = info['game_id']
+                     game_name = info['dist_game_nm']
+                     url = f"https://satg.telangana.gov.in/cmcup/viewschedulegames/{game_id}"
+                     txt = f"🗓️ **Schedule for {game_name}**\n\n"
+                     txt += f"You can view the specific schedule and fixtures here:\n"
+                     txt += f"👉 [View {game_name} Schedule]({url})"
+                     return create_api_response(txt, "sql_database", session_id)
+             except Exception as e:
+                 print(f"SQL Error (Schedule): {e}")
+
+
+    # 5. Geo Query
+    NAME_REGEX = r"([a-zA-Z\s\-\(\)]+?)"
+    geo_pattern_1 = fr"(?:district|mandal|village)\s*(?:does)?\s*{NAME_REGEX}\s*(?:belong|exist|register|in the db|in database)"
+    geo_pattern_2 = fr"is\s+{NAME_REGEX}\s+a\s+(?:village|district|mandal)"
+    geo_pattern_3 = fr"details\s*(?:for|about|of)?\s*{NAME_REGEX}"
+
+    geo_match = re.search(geo_pattern_1, original_query, re.IGNORECASE)
+    if not geo_match: geo_match = re.search(geo_pattern_2, original_query, re.IGNORECASE)
+    if not geo_match: geo_match = re.search(geo_pattern_3, original_query, re.IGNORECASE)
+
+    if geo_match:
+        raw_name = geo_match.group(1).strip()
+        clean_name = re.sub(r'\s+(district|mandal|village|zila|jilla)\b', '', raw_name, flags=re.IGNORECASE).strip()
+        
+        if len(clean_name) > 3 and clean_name.lower() not in ["the", "this", "that"]:
+            print(f"⚡ Intent: Geo Lookup ({clean_name})")
+            try:
+                res = get_geo_details(clean_name)
+                if res:
+                    t = res['type']
+                    d = res['data']
+                    txt = f"### 📍 Location Found: {d.get('vill_nm') or d.get('mandal_nm') or d.get('dist_nm')}\n"
+                    txt += f"**Type:** {t}\n"
+                    if t == 'Village':
+                        txt += f"**Mandal:** {d.get('parent_mandal')}\n"
+                        txt += f"**District:** {d.get('parent_district')}"
+                    elif t == 'Mandal':
+                        txt += f"**District:** {d.get('parent_district')}"
+                    return create_api_response(txt, "sql_database", session_id)
+                else:
+                    return create_api_response(f"🚫 **{clean_name}** could not be found in our Village/Mandal/District database.", "sql_database", session_id)
+            except Exception as e:
+                print(f"SQL Error: {e}")
+
+
+    # 5.4 Level Schedule Lookup (Deterministic)
+    schedule_pattern = r"(cluster|gp|gram\s*panchayat|mandal|ulb|district|state|assembly).*?(start|end|date|schedule|when|time)"
+    schedule_match = re.search(schedule_pattern, original_query, re.IGNORECASE)
+    if schedule_match:
+        level_keyword = schedule_match.group(1).lower()
+        print(f"⚡ Intent: Level Schedule Lookup (Level: {level_keyword})")
+        
+        # Hardcoded Schedule from 'CM_Cup_2025_RAG_Knowledge.txt'
+        # This ensures 100% accuracy vs RAG hallucinations
+        schedule_data = {
+            "gram": "🗓️ **Grampanchayat Level:** 17 January to 22 January 2026 (6 days)",
+            "gp": "🗓️ **Grampanchayat Level:** 17 January to 22 January 2026 (6 days)",
+            "cluster": "🗓️ **Grampanchayat/Cluster Level:** 17 January to 22 January 2026 (6 days)",
+            "mandal": "🗓️ **Mandal / ULB Level:** 28 January to 31 January 2026 (4 days)",
+            "ulb": "🗓️ **Mandal / ULB Level:** 28 January to 31 January 2026 (4 days)",
+            "assembly": "🗓️ **Assembly Constituency Level:** 03 February to 07 February 2026 (5 days)",
+            "district": "🗓️ **District Level:** 10 February to 14 February 2026 (5 days)",
+            "state": "🗓️ **State Level:** 19 February to 26 February 2026 (8 days)"
+        }
+        
+        # Find best match
+        response_txt = ""
+        for key, val in schedule_data.items():
+            if key in level_keyword:
+                response_txt = val
+                break
+        
+        if not response_txt:
+            # Fallback for 'cluster' mapping if not caught above logic simple match
+            if "cluster" in level_keyword: response_txt = schedule_data["cluster"]
+            if "gram" in level_keyword: response_txt = schedule_data["gram"]
+            if "mandal" in level_keyword: response_txt = schedule_data["mandal"]
+            if "district" in level_keyword: response_txt = schedule_data["district"]
+            if "state" in level_keyword: response_txt = schedule_data["state"]
+
+        if response_txt:
+             return create_api_response(f"{response_txt}\n\n*Note: Dates are subject to official guidelines.*", "static_rule_engine", session_id)
+
+    # 5.5 Discipline/Level Lookup
+    level_pattern = r"(disciplines?|sports?|games?|events?).*?\b(cluster|mandal|district|state)\b\s*(?:level)?"
+    level_match = re.search(level_pattern, original_query, re.IGNORECASE)
+    if level_match:
+        level_name = level_match.group(2).lower()
+        print(f"⚡ Intent: Discipline Lookup (Level: {level_name})")
+        try:
+            from rag.sql_queries import get_disciplines_by_level
+            games = get_disciplines_by_level(level_name)
+            if games:
+                txt = f"### 🏅 Sports at {level_name.title()} Level\n"
+                for g in games:
+                    txt += f"- {g}\n"
+                return create_api_response(txt, "sql_database", session_id)
+            else:
+                 # If SQL doesn't have data (e.g. new disciplines not in DB), Fallback to RAG
+                 print(f"ℹ️ SQL found no disciplines for {level_name}. Falling back to RAG.")
+                 pass 
+        except Exception as e:
+            print(f"SQL Error: {e}")
+            pass
+
+    # 5.6 Mandal Incharge / MEO Lookup (Interceptor)
+    # Pattern: "Mandal Incharge of X", "Mandal Officer for X", "Who is MEO of X"
+    meo_pattern = r"(?:mandal\s*(?:incharge|officer|meo|level|education officer)|meo)\s*(?:of|for|in)?\s*([a-zA-Z\s]+)"
+    meo_match = re.search(meo_pattern, original_query, re.IGNORECASE)
+    
+    # Exclude if it looks like just a menu navigation command like "Mandal Incharge" without a name
+    if meo_match:
+        raw_mandal = meo_match.group(1).strip()
+        clean_mandal = re.sub(r'\b(details|number|contact|name|who|is|the)\b', '', raw_mandal, flags=re.IGNORECASE).strip()
+        
+        if len(clean_mandal) > 3:
+             print(f"⚡ Intent: Mandal Incharge Lookup ({clean_mandal})")
+             try:
+                 from rag.location_search import search_mandal_incharge
+                 res = search_mandal_incharge(clean_mandal)
+                 if res:
+                    txt = f"### 🏫 Mandal In-Charge (MEO) - {res.get('mandal_name')}\n\n"
+                    txt += f"**Name:** {res.get('incharge_name')}\n"
+                    txt += f"**District:** {res.get('district_name')}\n"
+                    txt += f"**Mobile:** {res.get('mobile_no', 'N/A')}\n\n"
+                    txt += "Type another Mandal Name or 'Back'."
+                    return create_api_response(txt, "logic_interceptor", session_id)
+                 else:
+                     # If specific lookup fails, we can let it fall through or return not found.
+                     return create_api_response(f"ℹ️ I couldn't find a Mandal In-Charge for **{clean_mandal}**.\nPlease check the spelling (e.g., 'Jainad', 'Bela').", "logic_interceptor", session_id)
+             except Exception as e:
+                 print(f"Error in MEO Interceptor: {e}")
+
+    # 6. Complex SQL Queries (Agentic)
+    # Detects questions about counts, lists, specific aggregations (Agentic)
+    # 1. Strong Rule Keywords (Age, Born, Criteria) - Trigger SQL immediately (handles typos like 'hokey')
+    # 6. Complex SQL Queries (Agentic)
+    # Detects questions about counts, lists, specific aggregations (Agentic)
+    # 1. Strong Rule Keywords (Born, Birth) - Trigger SQL immediately
+    # NOTE: Removed 'rules', 'age', 'limit' to let RAG handle them.
+    if re.search(r"\b(born|birth)\b", original_query, re.IGNORECASE):
+        print(f"🤖 Intent: Rule/Age Query (Triggering SQL Agent)")
+        try:
+             lang_code = SESSION_DATA.get(session_id, {}).get('language', 'en')
+             lang_map = {"en": "English", "te": "Telugu", "hi": "Hindi"}
+             lang_name = lang_map.get(lang_code, "English")
+             sql_response = run_sql_agent(original_query, language=lang_name)
+             if "I try to query" not in sql_response and "error" not in sql_response.lower():
+                 return create_api_response(sql_response, "sql_agent", session_id)
+        except Exception as e:
+             print(f"SQL Agent Failed: {e}")
+
+    # 2. General SQL Intents (Count, List, Who is) - Require a target object (player, sport, etc.)
+    sql_intent_pattern = r"(how many|count|total|list|show|who is|what is|find).*(player|registration|venue|match|game|sport|cluster|incharge|hockey|cricket|kabaddi|kho|athletics|volleyball|ball|tennis|cycling|wrestling|karate|taekwondo|gymnastics|swimming|yoga|particip)"
+    if re.search(sql_intent_pattern, original_query, re.IGNORECASE):
+        print(f"🤖 Intent: Complex/Agentic SQL Query")
+        try:
+            lang_code = SESSION_DATA.get(session_id, {}).get('language', 'en')
+            lang_map = {"en": "English", "te": "Telugu", "hi": "Hindi"}
+            lang_name = lang_map.get(lang_code, "English")
+            sql_response = run_sql_agent(original_query, language=lang_name)
+            # if agent fails to understand, it might return a generic error.
+            # We can check specific error strings if we want to fallback to RAG.
+            if "I try to query" not in sql_response and "error" not in sql_response.lower():
+                return create_api_response(sql_response, "sql_agent", session_id)
+        except Exception as e:
+            print(f"SQL Agent Failed: {e}")
+            # Fallthrough to RAG if SQL agent fails
+            pass
+
+    # 7. RAG Fallback
+    print(f"🧠 Intent: General Query")
+    
+    try:
+        # Use Lazy Loaded Chain
+        rag = get_or_init_rag_chain()
+        if not rag:
+             return create_api_response("The AI Brain is initializing. Please try again in 10 seconds.", "system", session_id)
+        
+        # Memory Management
+        # session_id passed in args
+        chat_history = []
+        if session_id:
+            chat_history = CHAT_SESSIONS.get(session_id, [])
+        
+        # Invoke Chain with History
+        # Inject Language Instruction
+        lang_code = SESSION_DATA.get(session_id, {}).get('language', 'en')
+        lang_map = {"en": "English", "te": "Telugu", "hi": "Hindi"}
+        lang_name = lang_map.get(lang_code, "English")
+        
+        final_query = f"{original_query}" # Removed redundant instruction since we pass language param now
+                     
+        input_payload = {"question": final_query, "chat_history": chat_history, "language": lang_name}
+        
+        # rag.invoke now expects a dict because we updated chain.py
+        response_data = rag.invoke(input_payload)
+        
+        # response_data is a dictionary from ask_llm {"response", "model_used"}
+        if isinstance(response_data, dict):
+            final_answer = response_data.get("response", "No response")
+            # model = response_data.get("model_used", "rag") # Logic moved to wrapper
+        else:
+             final_answer = str(response_data)
+             # model = "rag"
+
+        # Update Memory
+        if session_id:
+            # Append turn: (User, AI)
+            chat_history.append(("User", original_query))
+            chat_history.append(("AI", final_answer))
+            # Keep last 10 turns (20 items)
+            CHAT_SESSIONS[session_id] = chat_history[-20:]
+
+        return create_api_response(final_answer, "rag_knowledge_base", session_id)
+    except Exception as e:
+        print(f"RAG Crash: {e}")
+        return create_api_response(f"I encountered an error accessing the knowledge base. Error: {str(e)}", "error_handler", session_id)
+
+@app.post("/chat")
+async def chat_endpoint(request: ChatRequest):
+    current_session_id = request.session_id or str(uuid.uuid4())
+
+    if request.language:
+        if request.language == "en" or request.language == "hi" or request.language == "te":
+            if current_session_id in SESSION_DATA:
+                SESSION_DATA[current_session_id]["language"] = request.language
+            else:
+                SESSION_DATA[current_session_id] = {}
+                SESSION_DATA[current_session_id]["language"] = request.language
+
+    response_data = await process_user_query(request.query, current_session_id)
+
+    if isinstance(response_data, dict):
+        response_data["session_id"] = current_session_id
+        response_data["language"] = SESSION_DATA.get(
+            current_session_id, {}
+        ).get("language", "en")
+
+    return response_data
+
+@app.post("/ask")
+async def ask_endpoint(request: ChatRequest):
+    return await process_user_query(request.query, request.session_id)
+
+@app.get("/extendedchat")
+async def extended_chat_endpoint():
+    """
+    Returns a specific message 'Looking for something else?' 
+    and all Main Menu items. GET version, no params.
+    """
+    # 1. Use a default session/lang for GET requests
+    session_id = "default_get"
+    lang = "en" 
+
+    # 2. Get Extended Chat Text
+    msg_data = get_translation("TXT_EXTENDED_CHAT", lang)
+    text = msg_data.get("text", "Looking for something else? 🔍\n\nCheck all options in Main Menu")
+    
+    # 3. Get Main Menu Items
+    main_menu_data = get_translation(MENU_MAIN, lang)
+    buttons = main_menu_data.get("buttons", [])
+    
+    return create_api_response({"text": text, "buttons": buttons}, "extended_chat", session_id)
+
+# --------------------------------------------------
+# 9. WhatsApp Endpoint
+# --------------------------------------------------
+@app.post("/whatsappchat")
+async def whatsapp_chat_endpoint(request: WhatsAppChatRequest):
+    """
+    WhatsApp specialized endpoint.
+    Uses 'phone_number' (or alias) as session_id for continuity.
+    """
+    # Coalesce Message
+    user_message = (request.user_message or request.message or request.query or "").strip()
+    
+    # If empty, default to "CMCUP" to trigger the main menu
+    if not user_message:
+        print(f"ℹ️ WhatsApp message empty from {request.phone_number}, defaulting to 'CMCUP'")
+        user_message = "CMCUP"
+    
+    # Coalesce Phone / Session ID
+    # Priority: phone_number -> mobile -> phone -> waId -> sender
+    session_id = (
+        request.phone_number or 
+        request.mobile or 
+        request.phone or 
+        request.waId or 
+        request.sender
+    )
+
+    if not session_id:
+        print("⚠️ WhatsApp Endpoint: No valid phone/ID found. Session will be stateless.")
+        # We could raise error, but let's allow it to run stateless just in case testing without phone
+        # But this explains "different behavior" (statelessness).
+        # We'll generate a temp ID but print warning.
+        session_id = str(uuid.uuid4())
+
+    try:
+        # Call the unified logic
+        print(f"📱 WhatsApp Request from {session_id}: {user_message}")
+        return await process_user_query(user_message, session_id, phone_number=session_id)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Processing Error: {str(e)}")
+
+# Trigger Reload: Fixed CSV Data
